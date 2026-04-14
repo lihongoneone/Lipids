@@ -1,0 +1,4022 @@
+---
+title: "metabolome_data"
+documentclass: ctexart
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document:
+    latex_engine: xelatex
+---
+```{r include=FALSE}
+
+#每次都需要来看看是否标准化数据！！！！！！！！！！！
+
+library(data.table)
+metabolome_data <- fread("metabolome_data.csv")
+View(metabolome_data)
+# 将第一列（代谢物名称）设为行名，然后进行转置
+transposed_data <- as.data.frame(t(metabolome_data[, -1]))
+# 将列名设置为代谢物的名称
+colnames(transposed_data) <- metabolome_data$name
+# 添加一列 Patient_ID，其值为原来的列名（即患者编号）
+transposed_data$Patient_ID <- rownames(transposed_data)
+# 将行名重置为简单的数字序列（可选，让数据框更整洁）
+rownames(transposed_data) <- NULL
+# 重新排列列的顺序，让Patient_ID在第一列
+transposed_data <- transposed_data[, c("Patient_ID", metabolome_data$name)]
+
+#删除患者以_PC结尾和QC开头的行
+keep_rows <- !grepl("^QC|_PC$", transposed_data$Patient_ID)
+transposed_data_cleaned <- transposed_data[keep_rows, ]
+#删除分期为0和未随访满3年的人
+transposed_data_cleaned <- subset(transposed_data_cleaned, !Patient_ID %in% c("RKJ48", "YHY115", "ZYX188"))
+View(transposed_data_cleaned)
+
+#合并代谢和生存数据
+metabolome_survival <- fread("metabolome_survival.csv")
+merged_data <- merge(x = transposed_data_cleaned,      
+                     y = metabolome_survival, 
+                     by.x = "Patient_ID",             
+                     by.y = "id",                     
+                     all.x = TRUE)                     
+View(merged_data)
+### 对代谢物数据（第2列到第2867列）进行标准化,但是聚类和LASSO部分不需要用，聚类和LASSO分析部分已经设置标准化数据了
+#which(colnames(merged_data) == "X2866")
+#metabolite_cols <- 2:2867
+#merged_data[, metabolite_cols] <- as.data.frame(scale(merged_data[, metabolite_cols]))
+
+merged_data$surgery_date <- as.Date(merged_data$surgery_date)
+merged_data$sex <- factor(merged_data$sex)
+merged_data$stage <- factor(merged_data$stage)
+merged_data$smoking <- factor(merged_data$smoking)
+merged_data$alcohol <- factor(merged_data$alcohol)
+merged_data$neo_adjuvant_therapy <- factor(merged_data$neo_adjuvant_therapy)
+merged_data$perineural_invasion <- factor(merged_data$perineural_invasion)
+merged_data$TC <- as.numeric(merged_data$TC)
+merged_data$TG <- as.numeric(merged_data$TG)
+merged_data$HDL <- as.numeric(merged_data$HDL)
+merged_data$LDL <- as.numeric(merged_data$LDL)
+merged_data$non_HDL <- as.numeric(merged_data$non_HDL)
+merged_data$TG1 <- as.numeric(merged_data$TG1)
+merged_data$HDL1 <- as.numeric(merged_data$HDL1)
+merged_data$LDL1 <- as.numeric(merged_data$LDL1)
+merged_data$new_stage <- as.numeric(merged_data$new_stage)
+merged_data$stage_34vs12 <- factor(merged_data$stage_34vs12)
+merged_data$Dyslipidemia <- factor(merged_data$Dyslipidemia)
+merged_data$bmi2 <- factor(merged_data$bmi2)
+merged_data$bmi3 <- factor(merged_data$bmi3)
+merged_data$TG2 <- factor(merged_data$TG2)
+merged_data$TC2 <- factor(merged_data$TC2)
+merged_data$HDL2 <- factor(merged_data$HDL2)
+merged_data$LDL2 <- factor(merged_data$LDL2)
+merged_data$non_HDL2 <- factor(merged_data$non_HDL2)
+summary(merged_data)
+fwrite(merged_data,file = "merged_data.csv",row.names = FALSE)
+```
+
+#统计描述
+```{r}
+#正态分布检验 p < 0.05 拒绝原假设，认为不服从正态分布。
+shapiro.test(Blood_lipid$non_HDL)
+#进一步诊断
+par(mfrow=c(1,2))
+qqnorm(Blood_lipid$age); qqline(Blood_lipid$age, col="red")
+hist(Blood_lipid$age, breaks=30, main="Distribution of age")
+# 对数转换后再检验
+shapiro.test(log(Blood_lipid$age))
+
+
+library(tableone)
+# 创建要描述的变量列表
+my_vars <- c("age", "sex", "bmi", "smoking", "alcohol","new_stage","TG","TC","HDL","LDL","non_HDL")
+
+# 指定分类变量
+cat_vars <- c("sex", "smoking", "alcohol", "new_stage")
+
+# 创建表格对象
+tab1 <- CreateTableOne(vars = my_vars, 
+                       data = merged_data, 
+                       factorVars = cat_vars)
+
+# 查看完整表格
+print(tab1, 
+      showAllLevels = TRUE,  # 显示分类变量的所有水平
+      missing = TRUE,         # 显示缺失值信息
+      #nonnormal = c("age", "bmi","TG","TC","HDL","LDL","non_HDL") # 指定非正态分布的变量（可不填）
+      )        
+
+# 或输出更简洁的版本
+print(tab1, 
+      catDigits = 1,          # 分类变量百分比的小数位数
+      contDigits = 1,         # 连续变量的小数位数
+      pDigits = 3,            # p值小数位数（若需组间比较）
+      missing = TRUE,         # 显示缺失值信息
+      showAllLevels = TRUE,
+      #nonnormal = c("age", "bmi","TG","TC","HDL","LDL","non_HDL")
+      )
+```
+
+#LASSO分析和AUC(212)
+```{r}
+# 加载必要的包
+library(survival)
+library(glmnet)
+library(survminer)
+library(timeROC)
+
+# 1. 数据准备与分割,包含临床数据和脂质代谢物数据
+data <- merged_data
+rownames(data) <- data$Patient_ID
+
+# 提取代谢物数据，并且只包含lipid数据
+which(colnames(data) == "X2866")
+metabolome_data <- data[, 2:2867]
+#提取脂质代谢物的列
+lipid_names <- fread("lipid.csv")
+lipid_columns <- colnames(lipid_names)
+summary(lipid_columns)
+lipid_data <- metabolome_data[,lipid_columns]
+
+#标准化法脂质数据
+lipid_data <- as.data.frame(scale(lipid_data))
+summary(lipid_data)
+
+# 临床信息
+clinical_data <- data[, 2868:2924]
+
+# lipid_data: 标准化后的脂质代谢物数据（212行，脂质变量列）
+# clinical_data: 临床数据，包含dfs_time, dfs, age, sex, new_stage, smoking, bmi
+
+# 准备生存数据
+surv_time <- clinical_data$dfs_time  # 生存时间，单位：天
+surv_status <- clinical_data$dfs     # 生存状态
+surv_obj <- Surv(time = surv_time, event = surv_status)
+
+# 2. LASSO-Cox筛选关键脂质代谢物
+# 准备脂质数据矩阵
+X_lipids <- as.matrix(lipid_data)
+
+# 运行LASSO-Cox回归
+set.seed(123)
+lasso_fit <- cv.glmnet(x = X_lipids, 
+                       y = surv_obj, 
+                       family = "cox", 
+                       type.measure = "C",
+                       nfolds = 10,
+                       alpha = 1)
+
+# LASSO可视化：交叉验证误差图
+pdf("lasso_cv_plot.pdf", width = 8, height = 6)
+par(mar = c(5, 5, 4, 2) + 0.1)  # 调整边距
+plot(lasso_fit, 
+     cex.lab = 1.2,    # 坐标轴标签
+     cex.axis = 1.0,   # 坐标轴刻度
+     cex.main = 1.3)   # 标题
+title("LASSO-Cox Cross-Validation Curve", line = 2.5)
+dev.off()
+
+# 选择lambda.1se并提取被选中的脂质
+best_lambda <- lasso_fit$lambda.1se
+lasso_coef <- coef(lasso_fit, s = best_lambda)
+selected_lipids <- rownames(lasso_coef)[which(lasso_coef != 0)]
+selected_lipids <- selected_lipids[selected_lipids != "(Intercept)"]  # 移除截距项
+
+cat("Number of key lipid metabolites selected by LASSO:", length(selected_lipids), "\n")
+
+# 提取筛选出的脂质数据
+if(length(selected_lipids) > 0) {
+  lipid_selected_data <- lipid_data[, selected_lipids, drop = FALSE]
+} else {
+  stop("LASSO did not select any lipid metabolites")
+}
+
+# 3. 构建多因素Cox模型
+# 准备临床变量
+clinical_for_model <- clinical_data[, c('age', 'sex', 'new_stage', 'smoking', 'bmi')]
+clinical_for_model$sex <- as.factor(clinical_for_model$sex)
+clinical_for_model$smoking <- as.factor(clinical_for_model$smoking)
+clinical_for_model$new_stage <- as.numeric(clinical_for_model$new_stage)
+
+# 整合数据
+final_data <- cbind(lipid_selected_data, clinical_for_model)
+
+# 构建Cox模型
+cox_formula <- as.formula(paste("surv_obj ~", paste(colnames(final_data), collapse = " + ")))
+final_cox_model <- coxph(cox_formula, data = final_data)
+
+# 模型摘要
+cat("\n=== Cox Model Results ===\n")
+print(summary(final_cox_model))
+
+# 4. 计算风险评分并分组
+final_data$risk_score <- predict(final_cox_model, type = "lp")
+median_risk <- median(final_data$risk_score)
+final_data$risk_group <- ifelse(final_data$risk_score > median_risk, "High", "Low")
+
+# 5. Kaplan-Meier生存曲线
+km_fit <- survfit(surv_obj ~ risk_group, data = final_data)
+surv_plot <- ggsurvplot(km_fit, data = final_data,
+                        pval = TRUE, 
+                        risk.table = TRUE,
+                        title = "Kaplan-Meier Curve for Disease-Free Survival (DFS)",
+                        xlab = "Time (days)",
+                        risk.table.height = 0.25)
+
+pdf("km_survival_plot.pdf", width = 10, height = 8)
+print(surv_plot)
+dev.off()
+
+# 6. 计算1年、3年、5年AUC
+# 定义时间点（单位：天）
+roc_1year <- timeROC(T = surv_time, 
+                     delta = surv_status,
+                     marker = final_data$risk_score,
+                     cause = 1,
+                     times = 365,
+                     ROC = TRUE)
+
+roc_3year <- timeROC(T = surv_time,
+                     delta = surv_status,
+                     marker = final_data$risk_score,
+                     cause = 1,
+                     times = 1095,
+                     ROC = TRUE)
+
+roc_5year <- timeROC(T = surv_time,
+                     delta = surv_status,
+                     marker = final_data$risk_score,
+                     cause = 1,
+                     times = 1825,
+                     ROC = TRUE)
+
+# 输出AUC结果
+cat("\n=== Time-Dependent AUC ===\n")
+cat("1-year DFS AUC:", round(roc_1year$AUC[2], 3), "\n")
+cat("3-year DFS AUC:", round(roc_3year$AUC[2], 3), "\n")
+cat("5-year DFS AUC:", round(roc_5year$AUC[2], 3), "\n")
+
+# 7. 组合ROC曲线
+pdf("roc_all_years.pdf", width = 8, height = 6)
+par(mar = c(5, 5, 4, 2) + 0.1)
+plot(roc_1year, time = 365, col = "#2E9FDF", lwd = 2,
+     main = "Time-Dependent ROC Curves",
+     xlab = "1 - Specificity",
+     ylab = "Sensitivity",
+     cex.lab = 1.2,
+     cex.axis = 1.0,
+     cex.main = 1.3)
+plot(roc_3year, time = 1095, col = "#E7B800", lwd = 2, add = TRUE)
+plot(roc_5year, time = 1825, col = "#FC4E07", lwd = 2, add = TRUE)
+grid(col = "gray90", lty = "dotted")
+legend("bottomright", 
+       legend = c(paste("1-year: AUC =", round(roc_1year$AUC[2], 3)),
+                  paste("3-year: AUC =", round(roc_3year$AUC[2], 3)),
+                  paste("5-year: AUC =", round(roc_5year$AUC[2], 3))),
+       col = c("#2E9FDF", "#E7B800", "#FC4E07"),
+       lty = 1,
+       lwd = 2,
+       cex = 1.0,
+       bty = "n",
+       x.intersp = 0.8,
+       y.intersp = 1.2)
+dev.off()
+
+# 8. LASSO系数路径图
+pdf("lasso_coefficient_path.pdf", width = 8, height = 6)
+par(mar = c(5, 5, 4, 2) + 0.1)
+plot(lasso_fit$glmnet.fit, xvar = "lambda", 
+     cex.lab = 1.2,
+     cex.axis = 1.0,
+     main = "LASSO Coefficient Path")
+dev.off()
+
+# 9. 可选：风险评分分布图
+pdf("risk_score_distribution.pdf", width = 8, height = 6)
+par(mar = c(5, 5, 4, 2) + 0.1)
+hist(final_data$risk_score, 
+     breaks = 20,
+     main = "Distribution of Risk Scores",
+     xlab = "Risk Score",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     cex.lab = 1.2,
+     cex.axis = 1.0,
+     cex.main = 1.3)
+abline(v = median_risk, col = "red", lty = 2, lwd = 2)
+legend("topright", legend = c(paste("Median =", round(median_risk, 2))), 
+       col = "red", lty = 2, lwd = 2, cex = 0.9)
+dev.off()
+
+# 10. 可选：风险评分与生存时间散点图
+pdf("risk_score_vs_survival.pdf", width = 8, height = 6)
+par(mar = c(5, 5, 4, 2) + 0.1)
+plot(final_data$risk_score, surv_time,
+     col = ifelse(surv_status == 1, "red", "blue"),
+     pch = ifelse(surv_status == 1, 19, 1),
+     main = "Risk Score vs Survival Time",
+     xlab = "Risk Score",
+     ylab = "Survival Time (days)",
+     cex.lab = 1.2,
+     cex.axis = 1.0,
+     cex.main = 1.3)
+legend("topright", 
+       legend = c("Event", "Censored"),
+       col = c("red", "blue"),
+       pch = c(19, 1),
+       cex = 0.9)
+dev.off()
+
+cat("\nAll plots have been saved as PDF files.\n")
+
+```
+
+#LASSO分析和AUC(训练集和验证集)
+```{r}
+# 1. 数据准备与分割,包含临床数据和脂质代谢物数据
+data <- merged_data
+rownames(data) <- data$Patient_ID
+# 按诊断时间排序
+data_sorted <- data[order(data$surgery_date), ]
+# 设置分割比例
+train_ratio <- 0.5  # 训练集占50%
+# 计算训练集样本数
+n_total <- nrow(data_sorted)
+n_train <- round(n_total * train_ratio)
+# 按时间顺序分割
+train_data <- data_sorted[1:n_train, ]        # 前50%为训练集
+test_data <- data_sorted[(n_train+1):n_total, ] # 后50%为验证集
+
+#训练集和验证集反向验证
+#test_data <- data_sorted[1:n_train, ]      
+#train_data <- data_sorted[(n_train+1):n_total, ] 
+
+# 提取代谢物数据，并且只包含lipid数据
+which(colnames(train_data) == "X2866")
+train_metabolome <- train_data[, 2:2867]
+test_metabolome <- test_data[, 2:2867]
+
+lipid_names <- fread("lipid.csv")
+#或者提取聚类差异代谢物脂质
+#lipid_names <- fread("diff_lipid.csv")
+lipid_columns <- colnames(lipid_names)
+summary(lipid_columns)
+train_lipids <- train_metabolome[,lipid_columns]
+test_lipids<- test_metabolome[,lipid_columns]
+
+#标准化法脂质数据
+train_lipids <- as.data.frame(scale(train_lipids))
+test_lipids <- as.data.frame(scale(test_lipids))
+
+# 临床信息
+train_clinical <- train_data[, 2868:2924]
+test_clinical <- test_data[, 2868:2924]
+
+
+# 加载必要的包
+library(survival)
+library(glmnet)
+library(survminer)
+library(timeROC)
+library(gridExtra)
+# 1. 数据准备
+# 提取生存数据
+train_surv_time <- train_clinical$dfs_time
+train_surv_status <- train_clinical$dfs
+train_surv_obj <- Surv(time = train_surv_time, event = train_surv_status)
+
+test_surv_time <- test_clinical$dfs_time
+test_surv_status <- test_clinical$dfs
+test_surv_obj <- Surv(time = test_surv_time, event = test_surv_status)
+
+# 2. LASSO-Cox筛选关键脂质代谢物（仅在训练集）
+# 准备训练集脂质数据矩阵
+X_train_lipids <- as.matrix(train_lipids)
+
+# 运行LASSO-Cox回归
+set.seed(123)
+lasso_fit <- cv.glmnet(x = X_train_lipids, 
+                       y = train_surv_obj, 
+                       family = "cox", 
+                       type.measure = "C",
+                       nfolds = 10,
+                       alpha = 1)
+
+# 选择lambda.1se并提取被选中的脂质
+best_lambda <- lasso_fit$lambda.1se
+lasso_coef <- coef(lasso_fit, s = best_lambda)
+selected_lipids <- rownames(lasso_coef)[which(lasso_coef != 0)]
+
+# 移除可能的截距项
+selected_lipids <- selected_lipids[selected_lipids != "(Intercept)"]
+
+cat("训练集LASSO筛选出的关键脂质代谢物数量:", length(selected_lipids), "\n")
+
+if(length(selected_lipids) > 0) {
+  cat("具体为:", paste(selected_lipids, collapse = ", "), "\n")
+  # 提取训练集和验证集的筛选后脂质数据
+  train_lipid_selected <- train_lipids[, selected_lipids, drop = FALSE]
+  test_lipid_selected <- test_lipids[, selected_lipids, drop = FALSE]
+} else {
+  stop("LASSO未筛选出任何脂质代谢物，请检查数据或调整lambda。")
+}
+
+# 3. 准备临床变量（训练集和验证集）
+# 注意：smoking已编码为0/1，new_stage需要根据情况处理
+train_clinical_for_model <- train_clinical[, c('age', 'sex', 'new_stage', 'smoking', 'bmi')]
+test_clinical_for_model <- test_clinical[, c('age', 'sex', 'new_stage', 'smoking', 'bmi')]
+
+# 4. 整合数据
+train_final_data <- cbind(train_lipid_selected, train_clinical_for_model)
+test_final_data <- cbind(test_lipid_selected, test_clinical_for_model)
+
+# 5. 在训练集上构建Cox模型
+cox_formula <- as.formula(paste("train_surv_obj ~", 
+                                paste(colnames(train_final_data), collapse = " + ")))
+train_cox_model <- coxph(cox_formula, data = train_final_data)
+
+cat("\n=== 训练集Cox模型结果 ===\n")
+print(summary(train_cox_model))
+
+# 6. 计算风险评分
+# 训练集
+train_final_data$risk_score <- predict(train_cox_model, type = "lp")
+train_median_risk <- median(train_final_data$risk_score)
+train_final_data$risk_group <- ifelse(train_final_data$risk_score > train_median_risk, "High", "Low")
+
+# 验证集（使用训练集的模型参数）
+# 注意：验证集需要使用训练集的模型系数和变量进行预测
+test_final_data$risk_score <- predict(train_cox_model, newdata = test_final_data, type = "lp")
+test_final_data$risk_group <- ifelse(test_final_data$risk_score > train_median_risk, "High", "Low")
+
+# 7. 训练集生存分析
+train_km_fit <- survfit(train_surv_obj ~ risk_group, data = train_final_data)
+train_surv_palette <- c("#fd8d3c","#6baed6")  # 较浅的蓝色、橙色
+test_surv_palette <- c("#d94701","#2171b5")  # 较深的蓝色、橙色
+train_surv_plot <- ggsurvplot(train_km_fit, data = train_final_data,
+                              pval = TRUE, 
+                              pval.size = 8,
+                              risk.table = TRUE,
+                              risk.table.fontsize = 6,
+                              palette = train_surv_palette, # 使用较浅的颜色
+                              title = "Training set: Kaplan-Meier curve",
+                              font.title = c(22, "bold", "black"),
+                              font.x = c(20, "plain", "black"),
+                              font.y = c(20, "plain", "black"),
+                              font.tickslab = c(18, "plain", "black"),
+                              font.legend = c(16, "plain"),
+                              xlab = "Time (days)",
+                              tables.theme = theme(
+                                 axis.text.x = element_text(size = 18),   # X轴刻度数字
+                                 axis.text.y = element_text(size = 18),   # Y轴刻度数字（即风险表的行标签）
+                                 axis.title.x = element_text(size = 20),  # X轴标题（通常为“Time”）
+                                 axis.title.y = element_text(size = 20),  # Y轴标题（通常为“Number at risk”）
+                                 plot.title = element_text(size = 20,face = "bold")     # 风险表标题
+                              ))
+train_surv_plot$plot <- train_surv_plot$plot + theme(plot.title = element_text(hjust = 0.5))
+
+pdf("train_km_survival_plot.pdf", width = 10, height = 10)
+print(train_surv_plot)
+dev.off()
+
+
+
+# 8. 验证集生存分析
+test_km_fit <- survfit(test_surv_obj ~ risk_group, data = test_final_data)
+test_surv_plot <- ggsurvplot(test_km_fit, data = test_final_data,
+                             pval = TRUE, 
+                             pval.size = 8,
+                             risk.table = TRUE,
+                             risk.table.fontsize = 6, 
+                             palette = test_surv_palette,
+                             title = "Validation set: Kaplan-Meier curve",
+                             font.title = c(22, "bold", "black"),
+                             font.x = c(20, "plain", "black"),
+                             font.y = c(20, "plain", "black"),
+                             font.tickslab = c(18, "plain", "black"),
+                             font.legend = c(16, "plain"),
+                             xlab = "Time (days)",
+                              tables.theme = theme(
+                                  axis.text.x = element_text(size = 18),   # X轴刻度数字
+                                  axis.text.y = element_text(size = 18),   # Y轴刻度数字（即风险表的行标签）
+                                  axis.title.x = element_text(size = 20),  # X轴标题（通常为“Time”）
+                                  axis.title.y = element_text(size = 20),  # Y轴标题（通常为“Number at risk”）
+                                  plot.title = element_text(size = 20,face = "bold")     # 风险表标题
+                              ))
+test_surv_plot$plot <- test_surv_plot$plot + theme(plot.title = element_text(hjust = 0.5))
+
+pdf("test_km_survival_plot.pdf", width = 10, height = 10)
+print(test_surv_plot)
+dev.off()
+
+# 将两个图排列在一个页面
+combined_plots <- arrange_ggsurvplots(
+  list(train_surv_plot, test_surv_plot),
+  ncol = 2, nrow = 1,
+  print = FALSE  # 不立即打印
+)
+
+# 保存到一个PDF
+pdf("combined_km_survival_plots.pdf", width = 20, height = 10)
+print(combined_plots)
+dev.off()
+
+# 9. 训练集AUC计算
+train_roc_1year <- timeROC(T = train_surv_time, 
+                           delta = train_surv_status,
+                           marker = train_final_data$risk_score,
+                           cause = 1,
+                           times = 365,
+                           ROC = TRUE)
+
+train_roc_3year <- timeROC(T = train_surv_time,
+                           delta = train_surv_status,
+                           marker = train_final_data$risk_score,
+                           cause = 1,
+                           times = 1095,
+                           ROC = TRUE)
+
+train_roc_5year <- timeROC(T = train_surv_time,
+                           delta = train_surv_status,
+                           marker = train_final_data$risk_score,
+                           cause = 1,
+                           times = 1825,
+                           ROC = TRUE)
+
+# 10. 验证集AUC计算
+test_roc_1year <- timeROC(T = test_surv_time, 
+                          delta = test_surv_status,
+                          marker = test_final_data$risk_score,
+                          cause = 1,
+                          times = 365,
+                          ROC = TRUE)
+
+test_roc_3year <- timeROC(T = test_surv_time,
+                          delta = test_surv_status,
+                          marker = test_final_data$risk_score,
+                          cause = 1,
+                          times = 1095,
+                          ROC = TRUE)
+
+test_roc_5year <- timeROC(T = test_surv_time,
+                          delta = test_surv_status,
+                          marker = test_final_data$risk_score,
+                          cause = 1,
+                          times = 1825,
+                          ROC = TRUE)
+
+# 11. 输出AUC结果
+cat("\n=== 训练集时间依赖性AUC ===\n")
+cat("1年DFS AUC:", round(train_roc_1year$AUC[2], 3), "\n")
+cat("3年DFS AUC:", round(train_roc_3year$AUC[2], 3), "\n")
+cat("5年DFS AUC:", round(train_roc_5year$AUC[2], 3), "\n")
+
+cat("\n=== 验证集时间依赖性AUC ===\n")
+cat("1年DFS AUC:", round(test_roc_1year$AUC[2], 3), "\n")
+cat("3年DFS AUC:", round(test_roc_3year$AUC[2], 3), "\n")
+cat("5年DFS AUC:", round(test_roc_5year$AUC[2], 3), "\n")
+
+# 12. 绘制训练集和验证集ROC曲线对比
+pdf("roc_comparison.pdf", width = 12, height = 6)
+par(mfrow = c(1, 2))
+
+# 训练集ROC
+plot(train_roc_1year, time = 365, col = "#2E9FDF", lwd = 2,title = FALSE)
+plot(train_roc_3year, time = 1095, col = "#E7B800", lwd = 2, add = TRUE)
+plot(train_roc_5year, time = 1825, col = "#FC4E07", lwd = 2, add = TRUE)
+# 使用title()函数添加标题
+title(main = "Training set: Time-dependent ROC curve", 
+      cex.main = 1.2, font.main = 2, line = 2.5)
+legend("bottomright", 
+       legend = c(paste("1 year: AUC =", round(train_roc_1year$AUC[2], 3)),
+                  paste("3 years: AUC =", round(train_roc_3year$AUC[2], 3)),
+                  paste("5 years: AUC =", round(train_roc_5year$AUC[2], 3))),
+       col = c("#2E9FDF", "#E7B800", "#FC4E07"),
+       lty = 1, lwd = 2, cex = 0.8)
+
+# 验证集ROC
+plot(test_roc_1year, time = 365, col = "#2E9FDF", lwd = 2,title = FALSE)
+plot(test_roc_3year, time = 1095, col = "#E7B800", lwd = 2, add = TRUE)
+plot(test_roc_5year, time = 1825, col = "#FC4E07", lwd = 2, add = TRUE)
+# 使用title()函数添加标题
+title(main = "Validation set: Time-dependent ROC curve", 
+      cex.main = 1.2, font.main = 2, line = 2.5)
+legend("bottomright", 
+       legend = c(paste("1 year: AUC =", round(test_roc_1year$AUC[2], 3)),
+                  paste("3 years: AUC =", round(test_roc_3year$AUC[2], 3)),
+                  paste("5 years: AUC =", round(test_roc_5year$AUC[2], 3))),
+       col = c("#2E9FDF", "#E7B800", "#FC4E07"),
+       lty = 1, lwd = 2, cex = 0.8)
+
+dev.off()
+
+# 13. LASSO可视化
+pdf("lasso_results.pdf", width = 12, height = 6)
+par(mfrow = c(1, 2),mar = c(5, 4, 4, 2) + 0.1, oma = c(0, 0, 2, 0))
+
+# 系数路径图
+plot(lasso_fit$glmnet.fit, xvar = "lambda")
+title("LASSO Coefficient Path", line = 2.5)
+abline(v = -log(best_lambda), col = "red", lty = 2, lwd = 2)
+
+# 交叉验证误差图
+plot(lasso_fit)
+title("LASSO-Cox Cross-Validation Curve", line = 2.5)
+abline(v = -log(best_lambda), col = "red", lty = 2, lwd = 2)
+
+dev.off()
+
+# 14. 风险评分分布对比
+pdf("risk_score_distribution_comparison.pdf", width = 12, height = 6)
+par(mfrow = c(1, 2))
+
+# 训练集风险评分分布
+hist(train_final_data$risk_score, 
+     breaks = 20,
+     main = "Training set: Risk score distribution",
+     xlab = "risk score",
+     col = "lightblue",
+     border = "black")
+abline(v = train_median_risk, col = "red", lty = 2, lwd = 2)
+legend("topright", legend = paste("median =", round(train_median_risk, 2)), 
+       col = "red", lty = 2, lwd = 2, cex = 0.8)
+
+# 验证集风险评分分布
+hist(test_final_data$risk_score, 
+     breaks = 20,
+     main = "Validation set: Risk score distribution",
+     xlab = "risk score",
+     col = "lightgreen",
+     border = "black")
+abline(v = train_median_risk, col = "red", lty = 2, lwd = 2)
+legend("topright", legend = paste("median =", round(train_median_risk, 2)), 
+       col = "red", lty = 2, lwd = 2, cex = 0.8)
+
+dev.off()
+
+# 15. 保存关键结果
+# 保存筛选出的脂质代谢物
+#write.csv(data.frame(Lipid_Metabolites = selected_lipids), "selected_lipid_metabolites.csv", row.names = FALSE)
+
+# 保存模型系数
+model_coefficients <- data.frame(
+  Variable = names(coef(train_cox_model)),
+  Coefficient = coef(train_cox_model),
+  HR = exp(coef(train_cox_model)),
+  stringsAsFactors = FALSE
+)
+#write.csv(model_coefficients, "cox_model_coefficients.csv", row.names = FALSE)
+
+# 保存训练集和验证集的风险评分
+risk_scores <- data.frame(
+  Patient_ID = c(rownames(train_final_data), rownames(test_final_data)),
+  Dataset = c(rep("Training", nrow(train_final_data)), rep("Validation", nrow(test_final_data))),
+  Risk_Score = c(train_final_data$risk_score, test_final_data$risk_score),
+  Risk_Group = c(train_final_data$risk_group, test_final_data$risk_group),
+  stringsAsFactors = FALSE
+)
+write.csv(risk_scores, "risk_scores_all_patients.csv", row.names = FALSE)
+```
+#LASSO分析和AUC/C—index(训练集和验证集)
+```{r}
+# ==================== 加载必要的包 ====================
+library(survival)
+library(glmnet)
+library(survminer)
+library(timeROC)
+library(pROC)  # 用于DeLong检验
+library(data.table)
+library(survcomp)#用于计算C-index
+# ==================== 1. 数据准备与分割 ====================
+# 注意：这里假设已经加载了merged_data
+data <- merged_data
+rownames(data) <- data$Patient_ID
+
+# 按诊断时间排序
+data_sorted <- data[order(data$surgery_date), ]
+
+# 设置分割比例
+train_ratio <- 0.5  # 训练集占50%
+
+# 计算训练集样本数
+n_total <- nrow(data_sorted)
+n_train <- round(n_total * train_ratio)
+
+# 按时间顺序分割
+train_data <- data_sorted[1:n_train, ]        # 前50%为训练集
+test_data <- data_sorted[(n_train+1):n_total, ] # 后50%为验证集
+
+# 训练集和验证集反向验证（可选）
+# test_data <- data_sorted[1:n_train, ]      
+# train_data <- data_sorted[(n_train+1):n_total, ] 
+
+# 提取代谢物数据，并且只包含lipid数据
+which(colnames(train_data) == "X2866")
+train_metabolome <- train_data[, 2:2867]
+test_metabolome <- test_data[, 2:2867]
+
+lipid_names <- fread("lipid.csv")
+lipid_columns <- colnames(lipid_names)
+summary(lipid_columns)
+train_lipids <- train_metabolome[,lipid_columns]
+test_lipids <- test_metabolome[,lipid_columns]
+
+# 标准化脂质数据
+train_lipids <- as.data.frame(scale(train_lipids))
+test_lipids <- as.data.frame(scale(test_lipids))
+
+# 临床信息
+train_clinical <- train_data[, 2868:2924]
+test_clinical <- test_data[, 2868:2924]
+
+# ==================== 2. 提取生存数据 ====================
+train_surv_time <- train_clinical$dfs_time
+train_surv_status <- train_clinical$dfs
+train_surv_obj <- Surv(time = train_surv_time, event = train_surv_status)
+
+test_surv_time <- test_clinical$dfs_time
+test_surv_status <- test_clinical$dfs
+test_surv_obj <- Surv(time = test_surv_time, event = test_surv_status)
+
+# ==================== 3. LASSO-Cox筛选关键脂质代谢物（仅在训练集） ====================
+# 准备训练集脂质数据矩阵
+X_train_lipids <- as.matrix(train_lipids)
+
+# 运行LASSO-Cox回归
+set.seed(123)
+lasso_fit <- cv.glmnet(x = X_train_lipids, 
+                       y = train_surv_obj, 
+                       family = "cox", 
+                       type.measure = "C",
+                       nfolds = 10,
+                       alpha = 1)
+
+# 选择lambda.1se并提取被选中的脂质
+best_lambda <- lasso_fit$lambda.1se
+lasso_coef <- coef(lasso_fit, s = best_lambda)
+selected_lipids <- rownames(lasso_coef)[which(lasso_coef != 0)]
+
+# 移除可能的截距项
+selected_lipids <- selected_lipids[selected_lipids != "(Intercept)"]
+
+cat("训练集LASSO筛选出的关键脂质代谢物数量:", length(selected_lipids), "\n")
+
+if(length(selected_lipids) > 0) {
+  cat("具体为:", paste(selected_lipids, collapse = ", "), "\n")
+  # 提取训练集和验证集的筛选后脂质数据
+  train_lipid_selected <- train_lipids[, selected_lipids, drop = FALSE]
+  test_lipid_selected <- test_lipids[, selected_lipids, drop = FALSE]
+} else {
+  stop("LASSO未筛选出任何脂质代谢物，请检查数据或调整lambda。")
+}
+
+# ==================== 4. 准备临床变量（训练集和验证集） ====================
+# 注意：smoking已编码为0/1，new_stage需要根据情况处理
+train_clinical_for_model <- train_clinical[, c('age', 'sex', 'new_stage', 'smoking', 'bmi')]
+test_clinical_for_model <- test_clinical[, c('age', 'sex', 'new_stage', 'smoking', 'bmi')]
+
+# ==================== 5. 构建三种模型 ====================
+# 5.1 仅临床模型 (Clinical only)
+clinical_vars <- c('age', 'sex', 'new_stage', 'smoking', 'bmi')
+train_clinical_data <- train_clinical[, clinical_vars]
+test_clinical_data <- test_clinical[, clinical_vars]
+
+# 将分类变量转换为因子（确保训练集和验证集因子水平一致）
+factor_vars <- c('sex', 'smoking')
+for(var in factor_vars) {
+  train_clinical_data[[var]] <- as.factor(train_clinical_data[[var]])
+  # 验证集使用训练集的因子水平
+  test_clinical_data[[var]] <- factor(test_clinical_data[[var]], 
+                                      levels = levels(train_clinical_data[[var]]))
+}
+
+clinical_cox <- coxph(train_surv_obj ~ ., data = train_clinical_data)
+
+# 5.2 仅脂质模型 (Lipids only)
+train_lipid_model_data <- train_lipids[, selected_lipids, drop = FALSE]
+test_lipid_model_data <- test_lipids[, selected_lipids, drop = FALSE]
+
+lipids_cox <- coxph(train_surv_obj ~ ., data = train_lipid_model_data)
+
+# 5.3 联合模型 (Combined) - 整合LASSO筛选的脂质和临床变量
+train_final_data <- cbind(train_lipid_selected, train_clinical_for_model)
+test_final_data <- cbind(test_lipid_selected, test_clinical_for_model)
+
+# 处理联合模型中的因子变量
+for(var in factor_vars) {
+  train_final_data[[var]] <- as.factor(train_final_data[[var]])
+  test_final_data[[var]] <- factor(test_final_data[[var]], 
+                                   levels = levels(train_final_data[[var]]))
+}
+
+cox_formula <- as.formula(paste("train_surv_obj ~", 
+                                paste(colnames(train_final_data), collapse = " + ")))
+combined_cox <- coxph(cox_formula, data = train_final_data)
+
+cat("\n=== 训练集Cox模型结果 ===\n")
+cat("1. 仅临床模型:\n")
+print(summary(clinical_cox))
+cat("\n2. 仅脂质模型:\n")
+print(summary(lipids_cox))
+cat("\n3. 联合模型:\n")
+print(summary(combined_cox))
+
+# ==================== 6. 计算各模型风险评分 ====================
+# 训练集
+train_clinical_data$clinical_score <- predict(clinical_cox, type = "lp")
+train_lipid_model_data$lipid_score <- predict(lipids_cox, type = "lp")
+train_final_data$combined_score <- predict(combined_cox, type = "lp")
+
+# 验证集（使用训练集模型）
+test_clinical_data$clinical_score <- predict(clinical_cox, newdata = test_clinical_data, type = "lp")
+test_lipid_model_data$lipid_score <- predict(lipids_cox, newdata = test_lipid_model_data, type = "lp")
+test_final_data$combined_score <- predict(combined_cox, newdata = test_final_data, type = "lp")
+
+# 分别计算各模型在训练集的中位数风险阈值
+train_clinical_median <- median(train_clinical_data$clinical_score)
+train_lipid_median <- median(train_lipid_model_data$lipid_score)
+train_combined_median <- median(train_final_data$combined_score)
+
+cat("\n=== 各模型训练集风险评分中位数 ===\n")
+cat("临床模型中位数:", round(train_clinical_median, 3), "\n")
+cat("脂质模型中位数:", round(train_lipid_median, 3), "\n")
+cat("联合模型中位数:", round(train_combined_median, 3), "\n")
+
+# 使用各自模型的中位数进行风险分组
+# 训练集
+train_clinical_data$risk_group <- ifelse(train_clinical_data$clinical_score > train_clinical_median, "High", "Low")
+train_lipid_model_data$risk_group <- ifelse(train_lipid_model_data$lipid_score > train_lipid_median, "High", "Low")
+train_final_data$risk_group <- ifelse(train_final_data$combined_score > train_combined_median, "High", "Low")
+
+# 验证集（使用训练集各模型的中位数）
+test_clinical_data$risk_group <- ifelse(test_clinical_data$clinical_score > train_clinical_median, "High", "Low")
+test_lipid_model_data$risk_group <- ifelse(test_lipid_model_data$lipid_score > train_lipid_median, "High", "Low")
+test_final_data$risk_group <- ifelse(test_final_data$combined_score > train_combined_median, "High", "Low")
+
+# ==================== 7. 生存分析（三个模型对比） ====================
+# 分别绘制每个模型的生存曲线，避免使用函数导致的错误
+
+# 训练集生存曲线
+pdf("train_km_comparison_separate_medians.pdf", width = 15, height = 10)
+
+# 临床模型 - 训练集
+train_km_clinical <- survfit(train_surv_obj ~ train_clinical_data$risk_group)
+train_surv_plot_clinical <- ggsurvplot(train_km_clinical, 
+                                       data = train_clinical_data,
+                                       pval = TRUE, 
+                                       risk.table = TRUE,
+                                       title = "Training: Clinical Model",
+                                       xlab = "Time (days)",
+                                       legend.title = "Risk Group",
+                                       #legend.labs = c("Low", "High"),
+                                       palette = c("#2E9FDF", "#FC4E07"),
+                                       risk.table.height = 0.25)
+print(train_surv_plot_clinical)
+
+# 脂质模型 - 训练集
+train_km_lipids <- survfit(train_surv_obj ~ train_lipid_model_data$risk_group)
+train_surv_plot_lipids <- ggsurvplot(train_km_lipids, 
+                                     data = train_lipid_model_data,
+                                     pval = TRUE, 
+                                     risk.table = TRUE,
+                                     title = "Training: Lipids Model",
+                                     xlab = "Time (days)",
+                                     legend.title = "Risk Group",
+                                     #legend.labs = c("Low", "High"),
+                                     palette = c("#2E9FDF", "#FC4E07"),
+                                     risk.table.height = 0.25)
+print(train_surv_plot_lipids)
+
+# 联合模型 - 训练集
+train_km_combined <- survfit(train_surv_obj ~ train_final_data$risk_group)
+train_surv_plot_combined <- ggsurvplot(train_km_combined, 
+                                       data = train_final_data,
+                                       pval = TRUE, 
+                                       risk.table = TRUE,
+                                       title = "Training: Combined Model",
+                                       xlab = "Time (days)",
+                                       legend.title = "Risk Group",
+                                       #legend.labs = c("Low", "High"),
+                                       palette = c("#2E9FDF", "#FC4E07"),
+                                       risk.table.height = 0.25)
+print(train_surv_plot_combined)
+
+dev.off()
+
+# 验证集生存曲线
+pdf("test_km_comparison_separate_medians.pdf", width = 15, height = 10)
+
+# 临床模型 - 验证集
+test_km_clinical <- survfit(test_surv_obj ~ test_clinical_data$risk_group)
+test_surv_plot_clinical <- ggsurvplot(test_km_clinical, 
+                                      data = test_clinical_data,
+                                      pval = TRUE, 
+                                      risk.table = TRUE,
+                                      title = "Validation: Clinical Model",
+                                      xlab = "Time (days)",
+                                      legend.title = "Risk Group",
+                                      #legend.labs = c("Low", "High"),
+                                      palette = c("#2E9FDF", "#FC4E07"),
+                                      risk.table.height = 0.25)
+print(test_surv_plot_clinical)
+
+# 脂质模型 - 验证集
+test_km_lipids <- survfit(test_surv_obj ~ test_lipid_model_data$risk_group)
+test_surv_plot_lipids <- ggsurvplot(test_km_lipids, 
+                                    data = test_lipid_model_data,
+                                    pval = TRUE, 
+                                    risk.table = TRUE,
+                                    title = "Validation: Lipids Model",
+                                    xlab = "Time (days)",
+                                    legend.title = "Risk Group",
+                                    #legend.labs = c("Low", "High"),
+                                    palette = c("#2E9FDF", "#FC4E07"),
+                                    risk.table.height = 0.25)
+print(test_surv_plot_lipids)
+
+# 联合模型 - 验证集
+test_km_combined <- survfit(test_surv_obj ~ test_final_data$risk_group)
+test_surv_plot_combined <- ggsurvplot(test_km_combined, 
+                                      data = test_final_data,
+                                      pval = TRUE, 
+                                      risk.table = TRUE,
+                                      title = "Validation: Combined Model",
+                                      xlab = "Time (days)",
+                                      legend.title = "Risk Group",
+                                      #legend.labs = c("Low", "High"),
+                                      palette = c("#2E9FDF", "#FC4E07"),
+                                      risk.table.height = 0.25)
+print(test_surv_plot_combined)
+
+dev.off()
+
+# 将三个训练集模型放在一个图中比较（可选）
+pdf("train_km_side_by_side.pdf", width = 18, height = 6)
+par(mfrow = c(1, 3))
+
+# 临床模型
+train_km_clinical <- survfit(train_surv_obj ~ risk_group, data = train_clinical_data)
+plot(train_km_clinical, 
+     col = c("#2E9FDF", "#FC4E07"), 
+     lwd = 2,
+     main = "Training: Clinical Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", 
+       legend = c("High Risk", "Low Risk"), 
+       col = c("#2E9FDF", "#FC4E07"), 
+       lwd = 2, 
+       bty = "n")
+
+# 添加p值 - 使用公式形式指定数据
+pval_clinical <- surv_pvalue(survfit(train_surv_obj ~ risk_group, data = train_clinical_data), 
+                             data = train_clinical_data)$pval
+text(x = max(train_surv_time)*0.7, 
+     y = 0.9, 
+     labels = paste("p =", format(pval_clinical, digits = 3)), 
+     cex = 1.2)
+
+# 脂质模型
+train_km_lipids <- survfit(train_surv_obj ~ risk_group, data = train_lipid_model_data)
+plot(train_km_lipids, 
+     col = c("#2E9FDF", "#FC4E07"), 
+     lwd = 2,
+     main = "Training: Lipids Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", 
+       legend = c("High Risk", "Low Risk"), 
+       col = c("#2E9FDF", "#FC4E07"), 
+       lwd = 2, 
+       bty = "n")
+
+# 添加p值 - 使用公式形式指定数据
+pval_lipids <- surv_pvalue(survfit(train_surv_obj ~ risk_group, data = train_lipid_model_data), 
+                           data = train_lipid_model_data)$pval
+text(x = max(train_surv_time)*0.7, 
+     y = 0.9, 
+     labels = paste("p =", format(pval_lipids, digits = 3)), 
+     cex = 1.2)
+
+# 联合模型
+train_km_combined <- survfit(train_surv_obj ~ risk_group, data = train_final_data)
+plot(train_km_combined, 
+     col = c("#2E9FDF", "#FC4E07"), 
+     lwd = 2,
+     main = "Training: Combined Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", 
+       legend = c("High Risk", "Low Risk"), 
+       col = c("#2E9FDF", "#FC4E07"), 
+       lwd = 2, 
+       bty = "n")
+
+# 添加p值 - 使用公式形式指定数据
+pval_combined <- surv_pvalue(survfit(train_surv_obj ~ risk_group, data = train_final_data), 
+                             data = train_final_data)$pval
+text(x = max(train_surv_time)*0.7, 
+     y = 0.9, 
+     labels = paste("p =", format(pval_combined, digits = 3)), 
+     cex = 1.2)
+
+dev.off()
+
+# 将三个验证集模型放在一个图中比较（可选）
+pdf("test_km_side_by_side.pdf", width = 18, height = 6)
+par(mfrow = c(1, 3))
+
+# 临床模型
+test_km_clinical <- survfit(test_surv_obj ~ risk_group, data = test_clinical_data)
+plot(test_km_clinical, 
+     col = c("#2E9FDF", "#FC4E07"), 
+     lwd = 2,
+     main = "Validation: Clinical Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", 
+       legend = c("High Risk", "Low Risk"), 
+       col = c("#2E9FDF", "#FC4E07"), 
+       lwd = 2, 
+       bty = "n")
+
+# 添加p值 - 使用公式形式指定数据
+pval_clinical_test <- surv_pvalue(survfit(test_surv_obj ~ risk_group, data = test_clinical_data), 
+                                  data = test_clinical_data)$pval
+text(x = max(test_surv_time)*0.7, 
+     y = 0.9, 
+     labels = paste("p =", format(pval_clinical_test, digits = 3)), 
+     cex = 1.2)
+
+# 脂质模型
+test_km_lipids <- survfit(test_surv_obj ~ risk_group, data = test_lipid_model_data)
+plot(test_km_lipids, 
+     col = c("#2E9FDF", "#FC4E07"), 
+     lwd = 2,
+     main = "Validation: Lipids Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", 
+       legend = c("High Risk", "Low Risk"), 
+       col = c("#2E9FDF", "#FC4E07"), 
+       lwd = 2, 
+       bty = "n")
+
+# 添加p值 - 使用公式形式指定数据
+pval_lipids_test <- surv_pvalue(survfit(test_surv_obj ~ risk_group, data = test_lipid_model_data), 
+                                data = test_lipid_model_data)$pval
+text(x = max(test_surv_time)*0.7, 
+     y = 0.9, 
+     labels = paste("p =", format(pval_lipids_test, digits = 3)), 
+     cex = 1.2)
+
+# 联合模型
+test_km_combined <- survfit(test_surv_obj ~ risk_group, data = test_final_data)
+plot(test_km_combined, 
+     col = c("#2E9FDF", "#FC4E07"), 
+     lwd = 2,
+     main = "Validation: Combined Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", 
+       legend = c("High Risk", "Low Risk"), 
+       col = c("#2E9FDF", "#FC4E07"), 
+       lwd = 2, 
+       bty = "n")
+
+# 添加p值 - 使用公式形式指定数据
+pval_combined_test <- surv_pvalue(survfit(test_surv_obj ~ risk_group, data = test_final_data), 
+                                  data = test_final_data)$pval
+text(x = max(test_surv_time)*0.7, 
+     y = 0.9, 
+     labels = paste("p =", format(pval_combined_test, digits = 3)), 
+     cex = 1.2)
+
+dev.off()
+
+
+#将训练集和验证集6个模型评分生存曲线放在一个图形中
+
+pdf("6个模型评分生存曲线.pdf", width = 18, height = 12)
+par(mfrow = c(2, 3), mar = c(4, 4, 4, 2), oma = c(0, 0, 2, 0))
+
+# 颜色设置
+colors <- c("#2E9FDF", "#FC4E07")  # 蓝:低风险, 红:高风险
+
+# p值格式化函数
+format_pvalue <- function(p) {
+  if (p < 0.001) {
+    return("p < 0.001")
+  } else {
+    return(paste("p =", sprintf("%.3f", p)))
+  }
+}
+
+# 第1行：训练集
+
+# 1. 临床模型（训练集）
+train_km_clinical <- survfit(train_surv_obj ~ risk_group, data = train_clinical_data)
+plot(train_km_clinical, 
+     col = colors, 
+     lwd = 2,
+     main = "Training: Clinical Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", legend = c("High Risk", "Low Risk"), 
+       col = rev(colors), lwd = 2, bty = "n")
+pval_clinical <- surv_pvalue(train_km_clinical, data = train_clinical_data)$pval
+text(x = max(train_surv_time)*0.7, y = 0.9, 
+     labels = format_pvalue(pval_clinical), cex = 1.1)
+
+# 2. 脂质模型（训练集）
+train_km_lipids <- survfit(train_surv_obj ~ risk_group, data = train_lipid_model_data)
+plot(train_km_lipids, 
+     col = colors, 
+     lwd = 2,
+     main = "Training: Lipids Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", legend = c("High Risk", "Low Risk"), 
+       col = rev(colors), lwd = 2, bty = "n")
+pval_lipids <- surv_pvalue(train_km_lipids, data = train_lipid_model_data)$pval
+text(x = max(train_surv_time)*0.7, y = 0.9, 
+     labels = format_pvalue(pval_lipids), cex = 1.1)
+
+# 3. 联合模型（训练集）
+train_km_combined <- survfit(train_surv_obj ~ risk_group, data = train_final_data)
+plot(train_km_combined, 
+     col = colors, 
+     lwd = 2,
+     main = "Training: Combined Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", legend = c("High Risk", "Low Risk"), 
+       col = rev(colors), lwd = 2, bty = "n")
+pval_combined <- surv_pvalue(train_km_combined, data = train_final_data)$pval
+text(x = max(train_surv_time)*0.7, y = 0.9, 
+     labels = format_pvalue(pval_combined), cex = 1.1)
+
+#第2行：验证集
+
+# 4. 临床模型（验证集）
+test_km_clinical <- survfit(test_surv_obj ~ risk_group, data = test_clinical_data)
+plot(test_km_clinical, 
+     col = colors, 
+     lwd = 2,
+     main = "Validation: Clinical Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", legend = c("High Risk", "Low Risk"), 
+       col = rev(colors), lwd = 2, bty = "n")
+pval_clinical_test <- surv_pvalue(test_km_clinical, data = test_clinical_data)$pval
+text(x = max(test_surv_time)*0.7, y = 0.9, 
+     labels = format_pvalue(pval_clinical_test), cex = 1.1)
+
+# 5. 脂质模型（验证集）
+test_km_lipids <- survfit(test_surv_obj ~ risk_group, data = test_lipid_model_data)
+plot(test_km_lipids, 
+     col = colors, 
+     lwd = 2,
+     main = "Validation: Lipids Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", legend = c("High Risk", "Low Risk"), 
+       col = rev(colors), lwd = 2, bty = "n")
+pval_lipids_test <- surv_pvalue(test_km_lipids, data = test_lipid_model_data)$pval
+text(x = max(test_surv_time)*0.7, y = 0.9, 
+     labels = format_pvalue(pval_lipids_test), cex = 1.1)
+
+# 6. 联合模型（验证集）
+test_km_combined <- survfit(test_surv_obj ~ risk_group, data = test_final_data)
+plot(test_km_combined, 
+     col = colors, 
+     lwd = 2,
+     main = "Validation: Combined Model",
+     xlab = "Time (days)",
+     ylab = "Survival Probability")
+legend("topright", legend = c("High Risk", "Low Risk"), 
+       col = rev(colors), lwd = 2, bty = "n")
+pval_combined_test <- surv_pvalue(test_km_combined, data = test_final_data)$pval
+text(x = max(test_surv_time)*0.7, y = 0.9, 
+     labels = format_pvalue(pval_combined_test), cex = 1.1)
+
+# 添加总标题
+mtext("Kaplan-Meier Survival Curves Comparison", 
+      outer = TRUE, cex = 1.3, font = 2, line = 0.5)
+
+dev.off()
+
+
+
+# 创建生存分析结果汇总表
+# 使用survdiff函数计算p值，避免surv_pvalue的数据问题
+survival_summary <- data.frame(
+  Dataset = rep(c("Training", "Validation"), each = 3),
+  Model = rep(c("Clinical", "Lipids", "Combined"), 2),
+  LowRisk_Events = c(
+    sum(train_surv_status[train_clinical_data$risk_group == "Low"] == 1),
+    sum(train_surv_status[train_lipid_model_data$risk_group == "Low"] == 1),
+    sum(train_surv_status[train_final_data$risk_group == "Low"] == 1),
+    sum(test_surv_status[test_clinical_data$risk_group == "Low"] == 1),
+    sum(test_surv_status[test_lipid_model_data$risk_group == "Low"] == 1),
+    sum(test_surv_status[test_final_data$risk_group == "Low"] == 1)
+  ),
+  HighRisk_Events = c(
+    sum(train_surv_status[train_clinical_data$risk_group == "High"] == 1),
+    sum(train_surv_status[train_lipid_model_data$risk_group == "High"] == 1),
+    sum(train_surv_status[train_final_data$risk_group == "High"] == 1),
+    sum(test_surv_status[test_clinical_data$risk_group == "High"] == 1),
+    sum(test_surv_status[test_lipid_model_data$risk_group == "High"] == 1),
+    sum(test_surv_status[test_final_data$risk_group == "High"] == 1)
+  ),
+  P_Value = c(
+    # 使用survdiff计算p值
+    pchisq(survdiff(train_surv_obj ~ risk_group, data = train_clinical_data)$chisq, df = 1, lower.tail = FALSE),
+    pchisq(survdiff(train_surv_obj ~ risk_group, data = train_lipid_model_data)$chisq, df = 1, lower.tail = FALSE),
+    pchisq(survdiff(train_surv_obj ~ risk_group, data = train_final_data)$chisq, df = 1, lower.tail = FALSE),
+    pchisq(survdiff(test_surv_obj ~ risk_group, data = test_clinical_data)$chisq, df = 1, lower.tail = FALSE),
+    pchisq(survdiff(test_surv_obj ~ risk_group, data = test_lipid_model_data)$chisq, df = 1, lower.tail = FALSE),
+    pchisq(survdiff(test_surv_obj ~ risk_group, data = test_final_data)$chisq, df = 1, lower.tail = FALSE)
+  )
+)
+
+cat("\n=== 生存分析结果汇总 ===\n")
+print(survival_summary)
+
+# 保存生存分析结果
+#write.csv(survival_summary, "survival_analysis_summary_separate_medians.csv", row.names = FALSE)
+
+# 可选：使用log-rank检验计算p值（另一种方法）
+cat("\n=== Log-rank检验结果 ===\n")
+cat("训练集临床模型: p =", 
+    survdiff(train_surv_obj ~ risk_group, data = train_clinical_data)$pvalue, "\n")
+cat("训练集脂质模型: p =", 
+    survdiff(train_surv_obj ~ risk_group, data = train_lipid_model_data)$pvalue, "\n")
+cat("训练集联合模型: p =", 
+    survdiff(train_surv_obj ~ risk_group, data = train_final_data)$pvalue, "\n")
+cat("验证集临床模型: p =", 
+    survdiff(test_surv_obj ~ risk_group, data = test_clinical_data)$pvalue, "\n")
+cat("验证集脂质模型: p =", 
+    survdiff(test_surv_obj ~ risk_group, data = test_lipid_model_data)$pvalue, "\n")
+cat("验证集联合模型: p =", 
+    survdiff(test_surv_obj ~ risk_group, data = test_final_data)$pvalue, "\n")
+
+# # ==================== 8. 计算各模型AUC ====================
+# 定义计算AUC的函数
+calculate_auc <- function(surv_time, surv_status, risk_scores, times) {
+  auc_results <- numeric(length(times))
+  for(i in seq_along(times)) {
+    roc_result <- timeROC(T = surv_time, delta = surv_status,
+                          marker = risk_scores, cause = 1,
+                          times = times[i], ROC = TRUE)
+    auc_results[i] <- roc_result$AUC[2]
+  }
+  return(auc_results)
+}
+
+# 设置时间点
+time_points <- c(365, 1095, 1825)  # 1年, 3年, 5年
+
+# 训练集AUC
+train_auc <- data.frame(
+  Time = time_points,
+  Clinical = calculate_auc(train_surv_time, train_surv_status, 
+                           train_clinical_data$clinical_score, time_points),
+  Lipids = calculate_auc(train_surv_time, train_surv_status,
+                         train_lipid_model_data$lipid_score, time_points),
+  Combined = calculate_auc(train_surv_time, train_surv_status,
+                           train_final_data$combined_score, time_points)
+)
+
+# 验证集AUC
+test_auc <- data.frame(
+  Time = time_points,
+  Clinical = calculate_auc(test_surv_time, test_surv_status,
+                           test_clinical_data$clinical_score, time_points),
+  Lipids = calculate_auc(test_surv_time, test_surv_status,
+                         test_lipid_model_data$lipid_score, time_points),
+  Combined = calculate_auc(test_surv_time, test_surv_status,
+                           test_final_data$combined_score, time_points)
+)
+
+# ==================== 9. 输出AUC结果 ====================
+cat("\n=== 训练集各模型AUC比较（各自中位数分组） ===\n")
+print(train_auc)
+
+cat("\n=== 验证集各模型AUC比较（各自中位数分组） ===\n")
+print(test_auc)
+
+# 创建AUC汇总表格
+auc_summary <- data.frame(
+  Dataset = rep(c("Training", "Validation"), each = 3),
+  Model = rep(c("Clinical", "Lipids", "Combined"), 2),
+  AUC_1yr = c(train_auc[1, -1], test_auc[1, -1]),
+  AUC_3yr = c(train_auc[2, -1], test_auc[2, -1]),
+  AUC_5yr = c(train_auc[3, -1], test_auc[3, -1])
+)
+
+cat("\n=== AUC汇总表（各自中位数分组） ===\n")
+print(auc_summary)
+
+# 保存汇总表
+#write.csv(auc_summary, "auc_summary_table_separate_medians.csv", row.names = FALSE)
+
+# ==================== 10. 绘制综合ROC对比图 ====================
+pdf("model_comparison_roc.pdf", width = 15, height = 10)
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+
+colors <- c("#E41A1C", "#377EB8", "#4DAF4A")
+models <- c("Clinical", "Lipids", "Combined")
+
+# 第1行：训练集（3个时间点）
+for(t_idx in 1:length(time_points)) {
+  time <- time_points[t_idx]
+  
+  plot(1, type = "n", xlim = c(0, 1), ylim = c(0, 1),
+       xlab = "1 - Specificity", ylab = "Sensitivity",
+       main = paste0("Training: ", time/365, "-Year ROC"))
+  
+  for(m_idx in 1:length(models)) {
+    model <- models[m_idx]
+    risk_scores <- switch(model,
+                          "Clinical" = train_clinical_data$clinical_score,
+                          "Lipids" = train_lipid_model_data$lipid_score,
+                          "Combined" = train_final_data$combined_score)
+    
+    roc <- timeROC(T = train_surv_time, delta = train_surv_status,
+                   marker = risk_scores, cause = 1,
+                   times = time, ROC = TRUE)
+    
+    lines(roc$FP[, 2], roc$TP[, 2], 
+          col = colors[m_idx], lwd = 2, lty = 1)
+  }
+  
+  legend("bottomright", legend = paste0(models, " (AUC: ", 
+                                        round(c(train_auc[t_idx, "Clinical"], 
+                                                train_auc[t_idx, "Lipids"], 
+                                                train_auc[t_idx, "Combined"]), 3), ")"),
+         col = colors, lwd = 2, cex = 0.8)
+}
+
+# 第2行：验证集（3个时间点）
+for(t_idx in 1:length(time_points)) {
+  time <- time_points[t_idx]
+  
+  plot(1, type = "n", xlim = c(0, 1), ylim = c(0, 1),
+       xlab = "1 - Specificity", ylab = "Sensitivity",
+       main = paste0("Validation: ", time/365, "-Year ROC"))
+  
+  for(m_idx in 1:length(models)) {
+    model <- models[m_idx]
+    risk_scores <- switch(model,
+                          "Clinical" = test_clinical_data$clinical_score,
+                          "Lipids" = test_lipid_model_data$lipid_score,
+                          "Combined" = test_final_data$combined_score)
+    
+    roc <- timeROC(T = test_surv_time, delta = test_surv_status,
+                   marker = risk_scores, cause = 1,
+                   times = time, ROC = TRUE)
+    
+    lines(roc$FP[, 2], roc$TP[, 2], 
+          col = colors[m_idx], lwd = 2, lty = 1)
+  }
+  
+  legend("bottomright", legend = paste0(models, " (AUC: ", 
+                                        round(c(test_auc[t_idx, "Clinical"], 
+                                                test_auc[t_idx, "Lipids"], 
+                                                test_auc[t_idx, "Combined"]), 3), ")"),
+         col = colors, lwd = 2, cex = 0.8)
+}
+
+mtext("ROC curve comparison of models", 
+      outer = TRUE, cex = 1.2, font = 2)
+dev.off()
+
+# ==================== 11. 统计检验（模型间AUC差异） ====================
+# 比较模型间AUC差异（DeLong检验）
+cat("\n=== 训练集1年AUC DeLong检验（各自中位数分组）===\n")
+
+# 以1年AUC为例，比较训练集上各模型
+train_roc_objects <- list()
+for(model in models) {
+  risk_scores <- switch(model,
+                        "Clinical" = train_clinical_data$clinical_score,
+                        "Lipids" = train_lipid_model_data$lipid_score,
+                        "Combined" = train_final_data$combined_score)
+  
+  # 创建ROC对象（用于DeLong检验）
+  binary_status <- ifelse(train_surv_time <= 365 & train_surv_status == 1, 1, 0)
+  train_roc_objects[[model]] <- roc(binary_status ~ risk_scores)
+}
+
+# 执行成对DeLong检验
+cat("Clinical vs Lipids:\n")
+print(roc.test(train_roc_objects$Clinical, train_roc_objects$Lipids))
+
+cat("\nClinical vs Combined:\n")
+print(roc.test(train_roc_objects$Clinical, train_roc_objects$Combined))
+
+cat("\nLipids vs Combined:\n")
+print(roc.test(train_roc_objects$Lipids, train_roc_objects$Combined))
+
+# ==================== 12. 风险评分分布对比 ====================
+pdf("risk_score_distribution.pdf", width = 12, height = 12)
+par(mfrow = c(3, 2))
+
+# 定义绘制分布的函数
+plot_risk_distribution <- function(risk_scores, median_risk, dataset_name, model_name, color) {
+  hist(risk_scores, 
+       breaks = 20,
+       main = paste0(dataset_name, ": ", model_name, " Model Risk Scores"),
+       xlab = "Risk Score",
+       col = color,
+       border = "black")
+  abline(v = median_risk, col = "red", lty = 2, lwd = 2)
+  legend("topright", legend = paste("Median =", round(median_risk, 3)), 
+         col = "red", lty = 2, lwd = 2, cex = 0.8)
+}
+
+# 训练集风险评分分布
+plot_risk_distribution(train_clinical_data$clinical_score, 
+                       train_clinical_median, 
+                       "Training", "Clinical", "lightblue")
+# 验证集风险评分分布（使用训练集中位数作为参考线）
+plot_risk_distribution(test_clinical_data$clinical_score, 
+                       train_clinical_median, 
+                       "Validation", "Clinical", "lightblue")
+
+plot_risk_distribution(train_lipid_model_data$lipid_score, 
+                       train_lipid_median, 
+                       "Training", "Lipids", "lightgreen")
+
+plot_risk_distribution(test_lipid_model_data$lipid_score, 
+                       train_lipid_median, 
+                       "Validation", "Lipids", "lightgreen")
+
+
+plot_risk_distribution(train_final_data$combined_score, 
+                       train_combined_median, 
+                       "Training", "Combined", "lightcoral")
+
+plot_risk_distribution(test_final_data$combined_score, 
+                       train_combined_median, 
+                       "Validation", "Combined", "lightcoral")
+
+# 验证集风险评分分布（使用训练集中位数作为参考线）
+#plot_risk_distribution(test_clinical_data$clinical_score, 
+                       #train_clinical_median, 
+                       #"Validation", "Clinical", "lightblue")
+
+#plot_risk_distribution(test_lipid_model_data$lipid_score, 
+                       #train_lipid_median, 
+                      # "Validation", "Lipids", "lightgreen")
+
+#plot_risk_distribution(test_final_data$combined_score, 
+                       #train_combined_median, 
+                       #"Validation", "Combined", "lightcoral")
+
+dev.off()
+
+# ==================== 13. 风险分组统计 ====================
+# 统计各模型在训练集和验证集的风险分组情况
+risk_group_stats <- data.frame(
+  Dataset = character(),
+  Model = character(),
+  Low_Risk_Count = integer(),
+  High_Risk_Count = integer(),
+  Low_Risk_Percent = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# 训练集统计
+for(model_name in c("Clinical", "Lipids", "Combined")) {
+  risk_groups <- switch(model_name,
+                        "Clinical" = train_clinical_data$risk_group,
+                        "Lipids" = train_lipid_model_data$risk_group,
+                        "Combined" = train_final_data$risk_group)
+  
+  low_count <- sum(risk_groups == "Low")
+  high_count <- sum(risk_groups == "High")
+  total <- low_count + high_count
+  
+  risk_group_stats <- rbind(risk_group_stats, 
+                            data.frame(
+                              Dataset = "Training",
+                              Model = model_name,
+                              Low_Risk_Count = low_count,
+                              High_Risk_Count = high_count,
+                              Low_Risk_Percent = round(low_count/total * 100, 1)
+                            ))
+}
+
+# 验证集统计
+for(model_name in c("Clinical", "Lipids", "Combined")) {
+  risk_groups <- switch(model_name,
+                        "Clinical" = test_clinical_data$risk_group,
+                        "Lipids" = test_lipid_model_data$risk_group,
+                        "Combined" = test_final_data$risk_group)
+  
+  low_count <- sum(risk_groups == "Low")
+  high_count <- sum(risk_groups == "High")
+  total <- low_count + high_count
+  
+  risk_group_stats <- rbind(risk_group_stats, 
+                            data.frame(
+                              Dataset = "Validation",
+                              Model = model_name,
+                              Low_Risk_Count = low_count,
+                              High_Risk_Count = high_count,
+                              Low_Risk_Percent = round(low_count/total * 100, 1)
+                            ))
+}
+
+cat("\n=== 风险分组统计（各自中位数分组） ===\n")
+print(risk_group_stats)
+
+# 保存风险分组统计
+#write.csv(risk_group_stats, "risk_group_stats_separate_medians.csv", row.names = FALSE)
+
+# ==================== 14. 保存关键结果 ====================
+# 保存各模型中位数
+median_thresholds <- data.frame(
+  Model = c("Clinical", "Lipids", "Combined"),
+  Median_Threshold = c(train_clinical_median, train_lipid_median, train_combined_median)
+)
+#write.csv(median_thresholds, "median_thresholds_separate_medians.csv", row.names = FALSE)
+
+# 保存各模型系数
+save_model_coefficients <- function(model, model_name) {
+  coef_df <- data.frame(
+    Variable = names(coef(model)),
+    Coefficient = coef(model),
+    HR = exp(coef(model)),
+    stringsAsFactors = FALSE
+  )
+  write.csv(coef_df, paste0(model_name, "_coefficients_separate.csv"), row.names = FALSE)
+}
+
+save_model_coefficients(clinical_cox, "clinical")
+save_model_coefficients(lipids_cox, "lipids")
+save_model_coefficients(combined_cox, "combined")
+
+# 保存训练集和验证集的风险评分
+risk_scores_all <- data.frame(
+  Patient_ID = c(rownames(train_clinical_data), rownames(test_clinical_data)),
+  Dataset = c(rep("Training", nrow(train_clinical_data)), 
+              rep("Validation", nrow(test_clinical_data))),
+  Clinical_Score = c(train_clinical_data$clinical_score, test_clinical_data$clinical_score),
+  Lipids_Score = c(train_lipid_model_data$lipid_score, test_lipid_model_data$lipid_score),
+  Combined_Score = c(train_final_data$combined_score, test_final_data$combined_score),
+  Clinical_Group = c(train_clinical_data$risk_group, test_clinical_data$risk_group),
+  Lipids_Group = c(train_lipid_model_data$risk_group, test_lipid_model_data$risk_group),
+  Combined_Group = c(train_final_data$risk_group, test_final_data$risk_group),
+  stringsAsFactors = FALSE
+)
+
+#write.csv(risk_scores_all, "risk_scores_all_patients.csv", row.names = FALSE)
+
+
+# ==================== 计算整体C-index ====================
+cat("\n=== 计算整体C-index ===\n")
+
+# 计算整体C-index的函数
+calculate_overall_cindex <- function(model_cox, data, surv_time, surv_status) {
+  # 计算风险评分
+  risk_scores <- predict(model_cox, newdata = data, type = "lp")
+  
+  # 使用survcomp包计算整体C-index
+  cindex_obj <- survcomp::concordance.index(x = risk_scores,
+                                            surv.time = surv_time,
+                                            surv.event = surv_status,
+                                            method = "noether")
+  
+  return(cindex_obj$c.index)
+}
+
+# 训练集整体C-index
+train_cindex_overall <- data.frame(
+  Model = c("Clinical", "Lipids", "Combined"),
+  Cindex = c(
+    calculate_overall_cindex(clinical_cox, train_clinical_data, 
+                             train_surv_time, train_surv_status),
+    calculate_overall_cindex(lipids_cox, train_lipid_model_data,
+                             train_surv_time, train_surv_status),
+    calculate_overall_cindex(combined_cox, train_final_data,
+                             train_surv_time, train_surv_status)
+  ),
+  Dataset = "Training"
+)
+
+# 验证集整体C-index
+test_cindex_overall <- data.frame(
+  Model = c("Clinical", "Lipids", "Combined"),
+  Cindex = c(
+    calculate_overall_cindex(clinical_cox, test_clinical_data,
+                             test_surv_time, test_surv_status),
+    calculate_overall_cindex(lipids_cox, test_lipid_model_data,
+                             test_surv_time, test_surv_status),
+    calculate_overall_cindex(combined_cox, test_final_data,
+                             test_surv_time, test_surv_status)
+  ),
+  Dataset = "Validation"
+)
+
+# 合并结果
+overall_cindex_results <- rbind(train_cindex_overall, test_cindex_overall)
+
+# 输出结果
+cat("\n=== 整体C-index结果 ===\n")
+print(overall_cindex_results)
+
+# 保存结果
+write.csv(overall_cindex_results, "overall_cindex_results.csv", row.names = FALSE)
+
+# ==================== 可视化整体C-index ====================
+pdf("overall_cindex_comparison.pdf", width = 10, height = 6)
+par(mar = c(5, 5, 4, 2))
+
+# 准备数据
+models <- c("Clinical", "Lipids", "Combined")
+train_values <- train_cindex_overall$Cindex
+test_values <- test_cindex_overall$Cindex
+
+# 设置图形参数
+bar_positions <- barplot(height = rbind(train_values, test_values),
+                         beside = TRUE,
+                         names.arg = models,
+                         col = c("#4DAF4A", "#377EB8"),
+                         ylim = c(0, 1),
+                         ylab = "Overall C-index",
+                         main = "Overall C-index Comparison",
+                         cex.names = 1.2,
+                         cex.lab = 1.2)
+
+# 添加数值标签
+text(x = bar_positions[1,], y = train_values + 0.02,
+     labels = sprintf("%.3f", train_values), cex = 1.1)
+text(x = bar_positions[2,], y = test_values + 0.02,
+     labels = sprintf("%.3f", test_values), cex = 1.1)
+
+# 添加图例
+legend("topright", legend = c("Training", "Validation"),
+       fill = c("#4DAF4A", "#377EB8"), cex = 1.1)
+
+# 添加网格线
+#grid(nx = NA, ny = NULL, lty = 2, col = "gray90")
+
+dev.off()
+
+
+
+# ==================== 时间依赖C-index计算 ====================
+cat("\n=== 计算时间依赖C-index ===\n")
+
+# 设置时间点
+cindex_times <- c(365, 1095, 1825)  # 1年, 3年, 5年
+
+# 计算时间依赖C-index的函数
+calculate_td_cindex <- function(model_cox, data, surv_time, surv_status, times) {
+  # 计算风险评分
+  risk_scores <- predict(model_cox, newdata = data, type = "lp")
+  
+  cindex_results <- numeric(length(times))
+  
+  for(i in seq_along(times)) {
+    # 创建截断的生存数据
+    truncated_time <- pmin(surv_time, times[i])
+    truncated_status <- surv_status
+    truncated_status[surv_time > times[i]] <- 0  # 超过该时间点的视为删失
+    
+    # 使用survcomp包计算C-index
+    cindex_obj <- survcomp::concordance.index(x = risk_scores,
+                                              surv.time = truncated_time,
+                                              surv.event = truncated_status,
+                                              method = "noether")
+    
+    cindex_results[i] <- cindex_obj$c.index
+  }
+  
+  return(cindex_results)
+}
+
+# 训练集C-index
+train_cindex <- data.frame(
+  Time = cindex_times,
+  Clinical = calculate_td_cindex(clinical_cox, train_clinical_data, 
+                                 train_surv_time, train_surv_status, cindex_times),
+  Lipids = calculate_td_cindex(lipids_cox, train_lipid_model_data,
+                               train_surv_time, train_surv_status, cindex_times),
+  Combined = calculate_td_cindex(combined_cox, train_final_data,
+                                 train_surv_time, train_surv_status, cindex_times)
+)
+
+# 验证集C-index
+test_cindex <- data.frame(
+  Time = cindex_times,
+  Clinical = calculate_td_cindex(clinical_cox, test_clinical_data,
+                                 test_surv_time, test_surv_status, cindex_times),
+  Lipids = calculate_td_cindex(lipids_cox, test_lipid_model_data,
+                               test_surv_time, test_surv_status, cindex_times),
+  Combined = calculate_td_cindex(combined_cox, test_final_data,
+                                 test_surv_time, test_surv_status, cindex_times)
+)
+
+# 输出结果
+cat("\n=== 训练集时间依赖C-index ===\n")
+print(train_cindex)
+
+cat("\n=== 验证集时间依赖C-index ===\n")
+print(test_cindex)
+
+# 保存结果
+#write.csv(train_cindex, "train_time_dependent_cindex.csv", row.names = FALSE)
+#write.csv(test_cindex, "test_time_dependent_cindex.csv", row.names = FALSE)
+
+# ==================== 绘制C-index对比图 ====================
+pdf("time_dependent_cindex_comparison.pdf", width = 14, height = 7)
+par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+
+# 颜色设置
+colors <- c("#E41A1C", "#377EB8", "#4DAF4A")
+models <- c("Clinical", "Lipids", "Combined")
+
+# 训练集
+plot(1, type = "n", xlim = c(0.5, 3.5), ylim = c(0.5, 1.0),
+     xlab = "Time (Years)", ylab = "C-index",
+     main = "Training Set", xaxt = "n")
+axis(1, at = 1:3, labels = c("1", "3", "5"))
+
+for(m_idx in 1:length(models)) {
+  model <- models[m_idx]
+  cindex_values <- train_cindex[[model]]
+  
+  lines(1:3, cindex_values, 
+        type = "b", col = colors[m_idx], lwd = 2, pch = 16, cex = 1.2)
+  
+   for(i in 1:3) {
+  text(i, cindex_values[i] + 0.01, 
+      sprintf("%.3f", cindex_values[i]), 
+col = colors[m_idx], cex = 0.9)
+ }
+}
+
+
+
+legend("bottomright", legend = models, col = colors, lwd = 2, pch = 16)
+
+# 验证集
+plot(1, type = "n", xlim = c(0.5, 3.5), ylim = c(0.5, 1.0),
+     xlab = "Time (Years)", ylab = "C-index",
+     main = "Validation Set", xaxt = "n")
+axis(1, at = 1:3, labels = c("1", "3", "5"))
+
+for(m_idx in 1:length(models)) {
+  model <- models[m_idx]
+  cindex_values <- test_cindex[[model]]
+  
+  lines(1:3, cindex_values, 
+        type = "b", col = colors[m_idx], lwd = 2, pch = 16, cex = 1.2)
+  
+  for(i in 1:3) {
+    text(i, cindex_values[i] + 0.01, 
+         sprintf("%.3f", cindex_values[i]), 
+         col = colors[m_idx], cex = 0.9)
+  }
+}
+legend("bottomright", legend = models, col = colors, lwd = 2, pch = 16)
+
+mtext("Time-dependent C-index Comparison", outer = TRUE, cex = 1.2, font = 2, line = -1.5)
+dev.off()
+
+# ==================== 性能汇总 ====================
+# 创建综合性能表
+performance_summary <- data.frame(
+  Dataset = rep(c("Training", "Validation"), each = 3),
+  Model = rep(c("Clinical", "Lipids", "Combined"), 2),
+  AUC_1yr = c(train_auc$Clinical[1], train_auc$Lipids[1], train_auc$Combined[1],
+              test_auc$Clinical[1], test_auc$Lipids[1], test_auc$Combined[1]),
+  AUC_3yr = c(train_auc$Clinical[2], train_auc$Lipids[2], train_auc$Combined[2],
+              test_auc$Clinical[2], test_auc$Lipids[2], test_auc$Combined[2]),
+  AUC_5yr = c(train_auc$Clinical[3], train_auc$Lipids[3], train_auc$Combined[3],
+              test_auc$Clinical[3], test_auc$Lipids[3], test_auc$Combined[3]),
+  Cindex_1yr = c(train_cindex$Clinical[1], train_cindex$Lipids[1], train_cindex$Combined[1],
+                 test_cindex$Clinical[1], test_cindex$Lipids[1], test_cindex$Combined[1]),
+  Cindex_3yr = c(train_cindex$Clinical[2], train_cindex$Lipids[2], train_cindex$Combined[2],
+                 test_cindex$Clinical[2], test_cindex$Lipids[2], test_cindex$Combined[2]),
+  Cindex_5yr = c(train_cindex$Clinical[3], train_cindex$Lipids[3], train_cindex$Combined[3],
+                 test_cindex$Clinical[3], test_cindex$Lipids[3], test_cindex$Combined[3])
+)
+
+cat("\n=== 综合性能汇总表 ===\n")
+print(performance_summary)
+write.csv(performance_summary, "AUC_vs_Cindex135.csv", row.names = FALSE)
+
+cat("\n时间依赖C-index计算完成！\n")
+#以上结束
+
+
+#==========补充DeLong检验==========
+# 加载必要包
+library(pROC)
+
+# 定义时间点
+time_points <- c(365, 1095, 1825)
+models <- c("Clinical", "Lipids", "Combined")
+
+# 创建存储结果的列表
+deLong_results <- list()
+
+for (dataset in c("Train", "Test")) {
+  if (dataset == "Train") {
+    surv_time <- train_surv_time
+    surv_status <- train_surv_status
+    risk_scores_list <- list(
+      Clinical = train_clinical_data$clinical_score,
+      Lipids = train_lipid_model_data$lipid_score,
+      Combined = train_final_data$combined_score
+    )
+  } else {
+    surv_time <- test_surv_time
+    surv_status <- test_surv_status
+    risk_scores_list <- list(
+      Clinical = test_clinical_data$clinical_score,
+      Lipids = test_lipid_model_data$lipid_score,
+      Combined = test_final_data$combined_score
+    )
+  }
+  
+  cat("\n========== ", dataset, "Set ==========\n")
+  
+  # 对每个时间点进行DeLong检验
+  for (t in time_points) {
+    cat("\n--- Time:", t/365, "years ---\n")
+    
+    # 创建二分类结局（在该时间点是否发生事件）
+    binary_status <- ifelse(surv_time <= t & surv_status == 1, 1, 0)
+    
+    # 生成ROC对象
+    roc_list <- list()
+    for (model in models) {
+      roc_list[[model]] <- roc(binary_status ~ risk_scores_list[[model]])
+    }
+    
+    # 成对比较
+    cat("Clinical vs Lipids:\n")
+    print(roc.test(roc_list$Clinical, roc_list$Lipids))
+    cat("\nClinical vs Combined:\n")
+    print(roc.test(roc_list$Clinical, roc_list$Combined))
+    cat("\nLipids vs Combined:\n")
+    print(roc.test(roc_list$Lipids, roc_list$Combined))
+  }
+}
+
+
+#混合模型：脂质系数固定（训练集），临床系数重新拟合（验证集）
+# ===== 混合模型：脂质系数固定（训练集），临床系数重新拟合（验证集） =====
+
+# 10.5.1 从训练集模型中提取脂质变量的系数
+train_coef <- coef(train_cox_model)
+# 找出哪些是脂质变量（根据筛选出的脂质变量名）
+lipid_vars <- selected_lipids
+clinical_vars <- c('age', 'sex', 'new_stage', 'smoking', 'bmi')
+
+# 提取脂质系数
+lipid_coef <- train_coef[names(train_coef) %in% lipid_vars]
+
+# 10.5.2 计算验证集的脂质部分风险评分（固定系数）
+# 确保验证集有相同的脂质变量
+test_lipid_data_for_mixed <- test_lipid_selected[, names(lipid_coef)]
+# 计算脂质部分线性预测
+test_lipid_part <- as.matrix(test_lipid_data_for_mixed) %*% lipid_coef
+
+# 10.5.3 在验证集上重新拟合临床变量（不含脂质）
+# 使用相同的临床变量
+test_clinical_for_mixed <- test_clinical_for_model[, clinical_vars]
+
+# 处理分类变量 - 与训练集保持一致
+# 假设训练集中的分类变量已经正确处理
+# 我们可以从训练集的临床数据中获取因子水平
+for(var in c('sex', 'new_stage', 'smoking')) {
+  if(is.factor(train_clinical_for_model[[var]])) {
+    # 使用训练集的因子水平
+    test_clinical_for_mixed[[var]] <- factor(test_clinical_for_mixed[[var]], 
+                                             levels = levels(train_clinical_for_model[[var]]))
+  }
+}
+
+# 构建生存对象（已经在前面定义过test_surv_obj）
+# 但为了清晰，再次定义
+mixed_surv_obj <- Surv(time = test_surv_time, event = test_surv_status)
+
+# 拟合仅临床变量的Cox模型（在验证集上）
+mixed_clinical_formula <- as.formula(paste("mixed_surv_obj ~", 
+                                           paste(clinical_vars, collapse = " + ")))
+mixed_clinical_model <- coxph(mixed_clinical_formula, data = test_clinical_for_mixed)
+
+# 10.5.4 提取临床部分系数并计算临床部分风险评分
+clinical_coef_mixed <- coef(mixed_clinical_model)
+test_clinical_part <- predict(mixed_clinical_model, type = "lp")
+
+# 10.5.5 计算混合模型总风险评分 = 脂质部分（固定系数）+ 临床部分（重新拟合）
+test_mixed_risk_score <- as.numeric(test_lipid_part) + as.numeric(test_clinical_part)
+
+# 10.5.6 计算混合模型AUC
+mixed_roc_1year <- timeROC(T = test_surv_time, 
+                           delta = test_surv_status,
+                           marker = test_mixed_risk_score,
+                           cause = 1,
+                           times = 365,
+                           ROC = TRUE)
+
+mixed_roc_3year <- timeROC(T = test_surv_time,
+                           delta = test_surv_status,
+                           marker = test_mixed_risk_score,
+                           cause = 1,
+                           times = 1095,
+                           ROC = TRUE)
+
+mixed_roc_5year <- timeROC(T = test_surv_time,
+                           delta = test_surv_status,
+                           marker = test_mixed_risk_score,
+                           cause = 1,
+                           times = 1825,
+                           ROC = TRUE)
+
+cat("\n=== 混合模型AUC结果 ===\n")
+cat("1年DFS AUC:", round(mixed_roc_1year$AUC[2], 3), "\n")
+cat("3年DFS AUC:", round(mixed_roc_3year$AUC[2], 3), "\n")
+cat("5年DFS AUC:", round(mixed_roc_5year$AUC[2], 3), "\n")
+# ==========
+```
+
+
+#PCA和PLS-DA分析
+```{r}
+# 加载必要包
+library(ggplot2)
+library(factoextra)
+library(ropls)
+# 假设你的数据框为data，列包括：SampleID, Relapse_Status（因子：Recurrence/No_Recurrence），以及后续的千余个脂质代谢物列（已归一化）
+# 提取代谢物数据（数值矩阵）
+data <- merged_data
+data$dfs_status <- factor(data$dfs,
+                          levels = c(0, 1),
+                          labels = c("No_Recurrence", "Recurrence"))
+
+rownames(data) <- data$Patient_ID
+metabolome_data <- data[, 2:2867] 
+lipid_names <- fread("lipid.csv")
+lipid_columns <- colnames(lipid_names)
+summary(lipid_columns)
+lipid_data <- metabolome_data[,lipid_columns]
+
+# 执行PCA（默认进行中心化，建议也进行标准化 scaling）
+pca_result <- prcomp(lipid_data, center = TRUE, scale. = TRUE)
+
+# 可视化：按复发状态着色
+fviz_pca_ind(pca_result,
+             geom.ind = "point", # 显示样本点
+             col.ind = data$dfs_status, # 按组着色
+             palette = c("#E7B800", "#2E9FDF"), # 自定义颜色
+             addEllipses = TRUE, # 添加置信椭圆
+             legend.title = " Dfs Status",
+             title = "PCA - Lipidomics Profile") +
+  theme_minimal()
+
+
+
+# 执行PLS-DA（有监督分析）
+plsda_result <- opls(x = lipid_data, 
+                     y = data$dfs_status,
+                     predI = 2,          # 指定潜变量数，通常从2开始
+                     orthoI = 0,         # 正交成分数（0表示PLS-DA，>0则为OPLS-DA）
+                     scaleC = "standard", # 标准化（与你PCA设置一致）
+                     info.txtC = "none", # 减少运行输出
+                     fig.pdfC = "none")   # 不自动输出PDF
+
+# 查看模型摘要
+plsda_result
+
+# 设置图形参数
+par(mfrow = c(2, 2)) # 2x2图形布局
+
+# 1. 样本得分图（核心可视化）
+plot(plsda_result, 
+     typeVc = "x-score", 
+     parAsColFcVn = data$dfs_status, # 按组着色
+     parPaletteVc = c("#E7B800", "#2E9FDF")) # 颜色与PCA一致
+title("PLS-DA Score Plot")
+
+# 2. 模型评估图
+plot(plsda_result, typeVc = "summary")
+title("Model Summary (R2, Q2)")
+
+# 3. 置换检验评估过拟合风险（重要！）
+if (!is.null(plsda_result@modelDF$`R2Y(cum)`)) {
+  plot(plsda_result, typeVc = "permutation")
+  title("Permutation Test (200 permutations)")
+}
+
+# 4. 载荷图（查看对分离贡献大的代谢物）
+plot(plsda_result, typeVc = "x-loading")
+title("Loading Plot (Top Contributing Lipids)")
+
+
+
+#  5.提取VIP值（变量重要性投影）
+vip_values <- getVipVn(plsda_result)
+
+# 按VIP值排序（VIP>1通常认为对分类有重要贡献）
+important_lipids <- sort(vip_values[vip_values > 1], decreasing = TRUE)
+head(important_lipids, 20) # 查看前20个重要脂质
+
+# 保存重要代谢物列表
+important_df <- data.frame(
+  Lipid = names(important_lipids),
+  VIP = as.numeric(important_lipids),
+  Rank = 1:length(important_lipids)
+)
+
+# 6. library(ggplot2)
+library(ggrepel) # 避免标签重叠
+
+# 提取得分
+scores <- as.data.frame(plsda_result@scoreMN)
+colnames(scores) <- c("t1", "t2")
+scores$Group <- data$dfs_status
+scores$Sample <- rownames(lipid_data)
+
+# 计算95%置信椭圆（按组）
+ellipse_data <- data.frame()
+for(g in levels(scores$Group)) {
+  group_data <- scores[scores$Group == g, c("t1", "t2")]
+  if(nrow(group_data) > 2) {
+    ellipse <- as.data.frame(ellipse::ellipse(
+      cov(group_data), 
+      centre = colMeans(group_data),
+      level = 0.95
+    ))
+    ellipse$Group <- g
+    ellipse_data <- rbind(ellipse_data, ellipse)
+  }
+}
+
+# 绘制高质量得分图（使用ggplot2内置椭圆函数）
+ggplot(scores, aes(x = t1, y = t2, color = Group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(level = 0.95, type = "norm", linetype = "dashed", size = 0.8) + # 添加95%置信椭圆
+  scale_color_manual(values = c("No_Recurrence" ="#E7B800" , 
+                                "Recurrence" = "#2E9FDF")) +
+  labs(x = paste("Component 1 (", 
+                 round(plsda_result@modelDF$R2X[1]*100, 1), "%)", sep = ""),
+       y = paste("Component 2 (", 
+                 round(plsda_result@modelDF$R2X[2]*100, 1), "%)", sep = ""), # 修正计算
+       title = "PLS-DA Score Plot: Lipidomics and Recurrence Status",
+       subtitle = paste("R2Y =", round(plsda_result@modelDF$`R2Y(cum)`, 3),
+                        ", Q2 =", round(plsda_result@modelDF$`Q2(cum)`, 3))) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dotted", alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dotted", alpha = 0.5)
+```
+
+#聚类
+```{r}
+library(cluster)
+library(factoextra)
+
+# 获取表格lipid的列名
+lipid <- fread("lipid.csv")
+lipid_columns <- colnames(lipid)
+rownames(transposed_data_cleaned) <- transposed_data_cleaned$Patient_ID
+# 获取表格中与lipid列名匹配的列
+common_columns <- colnames(transposed_data_cleaned)[colnames(transposed_data_cleaned) %in% lipid_columns]
+
+# 创建只包含匹配列的新表格
+mydata <- transposed_data_cleaned[, common_columns]
+View(mydata)
+
+#标准化数据
+mydata <- as.data.frame(scale(mydata))
+#summary(mydata_scaled)
+
+
+#kmeans聚类分析
+#肘部法(elbow methods)选择最佳的K值
+fviz_nbclust(mydata, kmeans, method = "wss")
+
+set.seed(123)
+km_model <- kmeans(mydata, centers = 3, nstart = 50)
+km_model
+#组别信息
+km_model$cluster
+
+#使用PCA先进行降维，再使用前两个主成分进行作图
+fviz_cluster(km_model, data = mydata,
+             palette = "jco",
+             ggtheme = theme_minimal())
+```
+##层次聚类分析
+```{r}
+#层次聚类分析
+#样本层次聚类
+hclust_result <- hclust(dist(lipid_data))
+# 绘制树状图
+fviz_dend(hclust_result, main = "Hierarchical Clustering of Patients")
+#图形美化
+fviz_dend(hclust_result, k = 2,cex = 0.5,color_labels_by_k = TRUE, rect = TRUE)
+
+
+#比较两组复发率差异
+# 创建2×2列联表
+data_matrix <- matrix(c(12, 14, 67, 119), nrow = 2, byrow = TRUE,
+                      dimnames = list(c("A组", "B组"), c("复发", "未复发")))
+
+# Fisher确切概率检验
+fisher_result <- fisher.test(data_matrix)
+print(fisher_result)
+
+# 卡方检验
+expected <- chisq.test(data_matrix)$expected
+expected
+chi_result <- chisq.test(data_matrix,correct = FALSE)
+print(chi_result)
+
+# 带Yates连续性校正的卡方检验
+chi_yates <- chisq.test(data_matrix, correct = TRUE)
+print(chi_yates)
+
+```
+
+```{r}
+#添加样本列名
+final_data <- cbind(
+  Patient_ID = transposed_data_cleaned[, 1],
+  mydata,
+  cluster = km_model$cluster
+)
+View(final_data)
+
+#与生存数据结合
+#合并代谢和生存数据
+metabolome_survival <- fread("metabolome_survival.csv")
+Clustered_data <- merge(x = final_data,      
+                     y = metabolome_survival, 
+                     by.x = "Patient_ID",             
+                     by.y = "id",                     
+                     all.x = TRUE)                     
+View(Clustered_data)
+
+Clustered_data$cluster2 <- ifelse(Clustered_data$cluster == 2, 2, 1)
+Clustered_data$cluster2 <- factor(Clustered_data$cluster2)
+Clustered_data$sex <- factor(Clustered_data$sex)
+Clustered_data$stage <- factor(Clustered_data$stage)
+Clustered_data$smoking <- factor(Clustered_data$smoking)
+Clustered_data$alcohol <- factor(Clustered_data$alcohol)
+Clustered_data$neo_adjuvant_therapy <- factor(Clustered_data$neo_adjuvant_therapy)
+Clustered_data$perineural_invasion <- factor(Clustered_data$perineural_invasion)
+Clustered_data$TC <- as.numeric(Clustered_data$TC)
+Clustered_data$TG <- as.numeric(Clustered_data$TG)
+Clustered_data$HDL <- as.numeric(Clustered_data$HDL)
+Clustered_data$LDL <- as.numeric(Clustered_data$LDL)
+Clustered_data$non_HDL <- as.numeric(Clustered_data$non_HDL)
+Clustered_data$TG1 <- as.numeric(Clustered_data$TG1)
+Clustered_data$HDL1 <- as.numeric(Clustered_data$HDL1)
+Clustered_data$LDL1 <- as.numeric(Clustered_data$LDL1)
+Clustered_data$new_stage <- as.numeric(Clustered_data$new_stage)
+Clustered_data$stage_34vs12 <- factor(Clustered_data$stage_34vs12)
+Clustered_data$Dyslipidemia <- factor(Clustered_data$Dyslipidemia)
+Clustered_data$bmi2 <- factor(Clustered_data$bmi2)
+Clustered_data$bmi3 <- factor(Clustered_data$bmi3)
+Clustered_data$TG2 <- factor(Clustered_data$TG2)
+Clustered_data$TC2 <- factor(Clustered_data$TC2)
+Clustered_data$HDL2 <- factor(Clustered_data$HDL2)
+Clustered_data$LDL2 <- factor(Clustered_data$LDL2)
+Clustered_data$non_HDL2 <- factor(Clustered_data$non_HDL2)
+Clustered_data$cluster <- factor(Clustered_data$cluster)
+Clustered_data$cluster2 <- factor(Clustered_data$cluster2)
+summary(Clustered_data)
+fwrite(Clustered_data,file = "Clustered_data.csv",row.names = FALSE)
+
+###生存分析
+library(survival)
+library(survminer)
+library(forestplot)
+
+# Kaplan-Meier 生存曲线比较
+#
+km_fit <- survfit(Surv(dfs_time, dfs) ~ cluster, data = Clustered_data)
+ggsurvplot(km_fit, 
+           data = Clustered_data,
+           pval = TRUE, 
+           conf.int = FALSE,
+           risk.table = TRUE,
+           legend.title = "cluster",
+           title = "Kaplan-Meier Survival",
+           xlab = "Time (days)")
+
+
+#单因素与多因素Cox回归
+cox_uni <- coxph(Surv(dfs_time, dfs) ~ cluster, data = Clustered_data)
+summary(cox_uni)
+cox_multi <- coxph(Surv(dfs_time, dfs) ~ cluster+sex+age+new_stage+smoking+bmi, data = Clustered_data)
+summary(cox_multi)
+#森林图可视化多因素结果
+ggforest(cox_multi, data = Clustered_data, main = "Hazard Ratio of Factors")
+
+
+#单因素与多因素逻辑回归
+library(broom)
+#单因素
+logit_uni <- glm(dfs_3yr ~ cluster, data = Clustered_data,family = binomial(link = "logit"))
+summary(logit_uni)
+logit_uni_OR <- tidy(logit_uni, exponentiate = TRUE, conf.int = TRUE)
+logit_uni_OR
+#多因素
+logit_multi <- glm(dfs_3yr ~ cluster+sex+age+new_stage+smoking+bmi,data =Clustered_data,family = binomial(link = "logit"))
+summary(logit_multi)
+logit_multi_OR <- tidy(logit_multi, exponentiate = TRUE, conf.int = TRUE)
+logit_multi_OR
+```
+
+##kmeans聚类分析
+```{r}
+# 加载必要的包
+library(cluster)
+library(factoextra)
+
+# 1. 数据准备与分割,包含临床数据和脂质代谢物数据
+data <- merged_data
+rownames(data) <- data$Patient_ID
+
+# 提取代谢物数据，并且只包含lipid数据
+which(colnames(data) == "X2866")
+metabolome_data <- data[, 2:2867]
+#提取脂质代谢物的列
+lipid_names <- fread("lipid.csv")
+lipid_columns <- colnames(lipid_names)
+summary(lipid_columns)
+lipid_data <- metabolome_data[,lipid_columns]
+
+#标准化法脂质数据
+lipid_data <- as.data.frame(scale(lipid_data))
+summary(lipid_data)
+
+# 临床信息
+clinical_data <- data[, 2868:2924]
+
+#kmeans聚类分析
+set.seed(123)
+#肘部法(elbow methods)选择最佳的K值
+fviz_nbclust(lipid_data, kmeans, method = "wss")
+
+# 假设选择k=3作为最佳聚类数
+k_optimal <- 3
+km_model <- kmeans(lipid_data, centers = k_optimal, nstart = 50)
+km_model
+#组别信息
+km_model$cluster
+
+#使用PCA先进行降维，再使用前两个主成分进行作图
+fviz_cluster(km_model, data = lipid_data,
+             palette = "jco",
+             ggtheme = theme_minimal())
+#或者改变参数，不显示文本标签
+fviz_cluster(km_model, data = lipid_data,
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             
+             # 可选参数
+             ellipse = TRUE,          # 使用椭圆代替凸包
+             ellipse.type = "convex",   # 椭圆类型（"norm", "euclid", "t", "convex"）
+             ellipse.level = 0.95,    # 椭圆置信水平
+             star.plot = FALSE,        # 显示连接中心点的星状图
+             repel = TRUE,            # 避免标签重叠
+             labelsize = 10,          # 标签大小
+             main = "K-means Clustering Visualization",  # 标题
+             #xlab = "PC1", ylab = "PC2",  # 坐标轴标签
+             show.clust.cent = TRUE,  # 显示聚类中心
+             geom = c("point"),  # 显示点和文本标签
+             pointsize = 2)            # 点大小
+
+
+
+clinical_data$cluster <- as.factor(km_model$cluster)
+#clinical_data$cluster <- factor(clinical_data$cluster, levels = c("2", "1", "3"))
+clinical_data$cluster2 <- ifelse(clinical_data$cluster == 2, 2, 1)
+clinical_data$cluster2 <- factor(clinical_data$cluster2)
+summary(clinical_data$cluster)
+summary(clinical_data$cluster2)
+
+
+###生存分析
+library(survival)
+library(survminer)
+library(forestplot)
+
+# Kaplan-Meier 生存曲线比较
+km_fit <- survfit(Surv(dfs_time, dfs) ~ cluster, data = clinical_data)
+ggsurvplot(km_fit, 
+           data = clinical_data,
+           pval = TRUE, 
+           conf.int = FALSE,
+           risk.table = TRUE,
+           legend.title = "cluster",
+           title = "Kaplan-Meier Survival",
+           xlab = "Time (days)")
+
+
+#单因素与多因素Cox回归
+cox_uni <- coxph(Surv(dfs_time, dfs) ~ cluster, data = clinical_data)
+summary(cox_uni)
+cox_multi <- coxph(Surv(dfs_time, dfs) ~ cluster+sex+age+new_stage+smoking+bmi, data = clinical_data)
+summary(cox_multi)
+#森林图可视化多因素结果
+ggforest(cox_multi, data = clinical_data, main = "Hazard Ratio of Factors")
+
+
+#单因素与多因素逻辑回归
+library(broom)
+#单因素
+logit_uni <- glm(dfs_3yr ~ cluster, data = clinical_data,family = binomial(link = "logit"))
+summary(logit_uni)
+logit_uni_OR <- tidy(logit_uni, exponentiate = TRUE, conf.int = TRUE)
+logit_uni_OR
+#多因素
+logit_multi <- glm(dfs_3yr ~ cluster+sex+age+new_stage+smoking+bmi,data =clinical_data,family = binomial(link = "logit"))
+summary(logit_multi)
+logit_multi_OR <- tidy(logit_multi, exponentiate = TRUE, conf.int = TRUE)
+logit_multi_OR
+
+
+
+#使用ANOVA筛选不同聚类间差异代谢物
+diff_metabolites <- sapply(colnames(lipid_data), function(metabolite) {
+  anova_result <- aov(lipid_data[[metabolite]] ~ clinical_data$cluster)
+  summary(anova_result)[[1]][["Pr(>F)"]][1]
+})
+
+#转换为数据框并添加多重检验校正
+diff_results <- data.frame(
+  metabolite = names(diff_metabolites),
+  p_value = diff_metabolites,
+  p_adjust = p.adjust(diff_metabolites, method = "fdr")  # FDR校正
+)
+
+# 选择FDR < 0.05的显著差异代谢物
+diff_metabolites_fdr <- p.adjust(diff_metabolites, method = "fdr")
+sig_metabolites <- names(diff_metabolites_fdr[diff_metabolites_fdr < 0.05])
+
+# （方法一）3.1差异代谢物热图
+library(pheatmap)
+library(dplyr)
+# 选择前50个最显著的差异代谢物（选择的是fdr校正后的差异代谢物）
+top_sig_metabolites <- diff_results %>%
+  filter(p_adjust < 0.05) %>%
+  arrange(p_adjust) %>%
+  head(50) %>%
+  pull(metabolite)
+
+# 提取训练集数据
+heatmap_data <- lipid_data[, top_sig_metabolites]
+
+# 添加聚类信息作为行注释
+annotation_row <- data.frame(Cluster = clinical_data$cluster)
+rownames(annotation_row) <- rownames(lipid_data)
+
+# 设置颜色
+colors_cluster <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")[1:length(unique(clinical_data$cluster))]
+names(colors_cluster) <- levels(clinical_data$cluster)
+ann_colors <- list(Cluster = colors_cluster)
+
+# 绘制热图
+pheatmap(t(heatmap_data),  # 转置不再进行标准化
+         main = "Differential Metabolites Heatmap",
+         cluster_rows = TRUE,      # 代谢物聚类
+         cluster_cols = TRUE,      # 样本聚类
+         show_colnames = FALSE,    # 不显示样本名（太多）
+         show_rownames = TRUE,     # 显示代谢物名
+         annotation_col = annotation_row,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         fontsize_row = 8,
+         cutree_rows = k_optimal,          # 按3类切割代谢物树状图
+         cutree_cols = k_optimal)          # 按3类切割样本树状图
+
+
+
+# （方法二）3.1 差异代谢物热图（按聚类排序）
+library(pheatmap)
+library(dplyr)
+
+# 选择前50个最显著的差异代谢物
+top_sig_metabolites <- diff_results %>%
+  filter(p_adjust < 0.05) %>%
+  arrange(p_adjust) %>%
+  head(50) %>%
+  pull(metabolite)
+
+# 提取数据
+heatmap_data <- lipid_data[, top_sig_metabolites]
+
+# 获取聚类信息并按聚类排序
+cluster_order <- order(clinical_data$cluster)
+heatmap_data_sorted <- heatmap_data[cluster_order, ]
+clinical_data_sorted <- clinical_data[cluster_order, ]
+
+# 添加聚类信息作为行注释
+annotation_row <- data.frame(Cluster = clinical_data_sorted$cluster)
+rownames(annotation_row) <- rownames(heatmap_data_sorted)
+
+# 设置颜色
+colors_cluster <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")[1:length(unique(clinical_data_sorted$cluster))]
+names(colors_cluster) <- levels(clinical_data_sorted$cluster)
+ann_colors <- list(Cluster = colors_cluster)
+
+# 绘制热图（样本按聚类排序，不对列进行聚类）
+pheatmap(t(heatmap_data_sorted),
+         main = "Differential Metabolites Heatmap",
+         cluster_rows = TRUE,      # 代谢物聚类
+         cluster_cols = FALSE,     # 不进行样本聚类，保持按聚类排序的顺序
+         show_colnames = FALSE,    # 不显示样本名
+         show_rownames = TRUE,     # 显示代谢物名
+         annotation_col = annotation_row,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         fontsize_row = 8,
+         cutree_rows = k_optimal,  # 按3类切割代谢物树状图
+         gaps_col =cumsum(table(clinical_data_sorted$cluster))[-length(table(clinical_data_sorted$cluster))],   #在聚类之间添加分隔线
+         breaks = seq(-2, 2, length.out = 101))
+```
+
+## 共识聚类
+```{r}
+# 共识聚类与确定分型 
+library(ConsensusClusterPlus)
+library(Rtsne)
+library(cluster)
+
+# 1. 共识聚类 (确定最佳聚类数K)
+# 将数据转为矩阵，行是样本，列是脂质
+mat_data <- as.matrix(mydata)
+
+title <- "./ConsensusCluster_Results" # 输出目录
+
+cc_res <- ConsensusClusterPlus(mat_data,
+                               maxK = 8,      # 测试的最大聚类数
+                               reps = 1000,   # 重抽样次数
+                               pItem = 0.8,   # 每次抽取80%样本
+                               pFeature = 0.8, # 每次抽取80%特征
+                               clusterAlg = "pam", 
+                               distance = "pearson",
+                               seed = 2024,
+                               title = title,
+                               plot = "png")
+
+# 2. 评估并选择K (通常选择共识累积分布函数图拐点或共识系数高的K)
+# 查看K=2,3,4时的共识矩阵热图
+# 根据结果，假设我们选择 K=3
+optimal_k <- 3
+sample_clusters <- cc_res[[optimal_k]]$consensusClass
+
+# 将聚类标签加入原始数据框
+df$lipid_cluster <- factor(sample_clusters)
+
+# 3. 使用t-SNE可视化聚类结果
+set.seed(123)
+tsne_res <- Rtsne(mat_data, perplexity = 15, dims = 2)
+tsne_df <- data.frame(TSNE1 = tsne_res$Y[,1], 
+                      TSNE2 = tsne_res$Y[,2], 
+                      Cluster = df$lipid_cluster)
+
+ggplot(tsne_df, aes(x = TSNE1, y = TSNE2, color = Cluster)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "t-SNE Visualization of Lipid Metabolism Subtypes")
+
+### R代码示例：生存分析 ###
+library(survival)
+library(survminer)
+library(forestplot)
+
+# 1. Kaplan-Meier 生存曲线比较
+km_fit <- survfit(Surv(time, status) ~ lipid_cluster, data = df)
+
+ggsurvplot(km_fit, 
+           data = df,
+           pval = TRUE, 
+           conf.int = FALSE,
+           risk.table = TRUE,
+           legend.title = "Lipid Cluster",
+           title = "Kaplan-Meier Survival by Lipid Metabolism Subtype",
+           xlab = "Time (Months)")
+
+# 2. 单因素与多因素Cox回归
+# 单因素: 仅评估脂质亚型
+cox_uni <- coxph(Surv(time, status) ~ lipid_cluster, data = df)
+summary(cox_uni)
+
+# 多因素: 校正其他变量 (例如年龄、性别、分期)
+# 假设你的数据框中还有 age, gender, stage 列
+cox_multi <- coxph(Surv(time, status) ~ lipid_cluster + age + gender + stage, 
+                   data = df)
+summary(cox_multi)
+
+# 3. 森林图可视化多因素结果 (展示风险比HR)
+ggforest(cox_multi, data = df, 
+         main = "Hazard Ratio of Factors Influencing Survival")
+
+
+
+
+
+
+
+
+```
+
+##kmeans训练集和验证集
+```{r}
+# 加载必要的包
+library(tidyverse)
+library(survival)
+library(survminer)
+#方法一
+# 设置随机种子确保结果可重复
+#set.seed(123)  # 任意数字，比如123，保证每次运行结果相同
+# 1. 数据准备
+#data <- merged_data
+#rownames(data) <- data$Patient_ID
+# 2. 随机打乱数据顺序
+#random_indices <- sample(1:nrow(data))  # 生成随机顺序
+#data_random <- data[random_indices, ]
+# 3. 计算训练集样本数
+#train_ratio <- 0.5
+#n_total <- nrow(data_random)
+#n_train <- round(n_total * train_ratio)
+# 4. 随机分割
+#train_data <- data_random[1:n_train, ]
+#test_data <- data_random[(n_train+1):n_total, ]
+
+
+#方法二
+# 1. 数据准备与分割,包含临床数据和脂质代谢物数据
+data <- merged_data
+rownames(data) <- data$Patient_ID
+# 按诊断时间排序
+data_sorted <- data[order(data$surgery_date), ]
+# 设置分割比例
+train_ratio <- 0.5  # 训练集占50%
+# 计算训练集样本数
+n_total <- nrow(data_sorted)
+n_train <- round(n_total * train_ratio)
+# 按时间顺序分割
+train_data <- data_sorted[1:n_train, ]        # 前50%为训练集
+test_data <- data_sorted[(n_train+1):n_total, ] # 后50%为验证集
+
+#训练集和验证集反向验证
+#test_data <- data_sorted[1:n_train, ]      
+#train_data <- data_sorted[(n_train+1):n_total, ] 
+
+# 提取代谢物数据，并且只包含lipid数据
+which(colnames(train_data) == "X2866")
+train_metabolome <- train_data[, 2:2867]
+test_metabolome <- test_data[, 2:2867]
+
+lipid_names <- fread("lipid.csv")
+lipid_columns <- colnames(lipid_names)
+summary(lipid_columns)
+train_lipids <- train_metabolome[,lipid_columns]
+test_lipids<- test_metabolome[,lipid_columns]
+
+#标准化法脂质数据
+train_lipids <- as.data.frame(scale(train_lipids))
+test_lipids <- as.data.frame(scale(test_lipids))
+
+# 临床信息
+train_clinical <- train_data[, 2868:2924]
+test_clinical <- test_data[, 2868:2924]
+
+# 2. 训练集聚类分析（k-means）
+set.seed(123)
+# 确定最佳k值（肘部法则）
+wss <- sapply(1:10, function(k) {
+  kmeans(train_lipids, centers = k, nstart = 50)$tot.withinss
+})
+
+# 绘制肘部图
+plot(1:10, wss, type = "b", xlab = "Number of clusters", ylab = "Within-cluster sum of squares", col = "#1f77b4")
+
+# 假设选择k=3作为最佳聚类数
+k_optimal <- 3
+kmeans_train <- kmeans(train_lipids, centers = k_optimal, nstart = 50)
+train_clinical$cluster <- as.factor(kmeans_train$cluster)
+#train_clinical$cluster <- factor(train_clinical$cluster, levels = c("2", "1", "3"))
+summary(train_clinical$cluster)
+
+# 3. 差异代谢物筛选
+# 使用ANOVA筛选不同聚类间差异代谢物
+diff_metabolites <- sapply(colnames(train_lipids), function(metabolite) {
+  anova_result <- aov(train_lipids[[metabolite]] ~ train_clinical$cluster)
+  summary(anova_result)[[1]][["Pr(>F)"]][1]
+})
+
+#转换为数据框并添加多重检验校正
+diff_results <- data.frame(
+  metabolite = names(diff_metabolites),
+  p_value = diff_metabolites,
+  p_adjust = p.adjust(diff_metabolites, method = "fdr")  # FDR校正
+)
+#fwrite(diff_results,file = "diff_results.csv",row.names = FALSE)
+
+# 选择FDR < 0.05的显著差异代谢物
+diff_metabolites_fdr <- p.adjust(diff_metabolites, method = "fdr")
+sig_metabolites <- names(diff_metabolites_fdr[diff_metabolites_fdr < 0.05])
+
+#(方法一) 3.1差异代谢物热图
+library(pheatmap)
+library(dplyr)
+# 选择前50个最显著的差异代谢物（选择的是fdr校正后的差异代谢物）
+top_sig_metabolites <- diff_results %>%
+  filter(p_adjust < 0.05) %>%
+  arrange(p_adjust) %>%
+  head(100) %>%
+  pull(metabolite)
+
+# 提取训练集数据
+heatmap_data <- train_lipids[, top_sig_metabolites]
+
+# 添加聚类信息作为行注释
+annotation_row <- data.frame(Cluster = train_clinical$cluster)
+rownames(annotation_row) <- rownames(train_lipids)
+
+# 设置颜色
+colors_cluster <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+                    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")[1:length(unique(train_clinical$cluster))]
+names(colors_cluster) <- levels(train_clinical$cluster)
+ann_colors <- list(Cluster = colors_cluster)
+
+# 绘制热图
+pheatmap(t(heatmap_data),  # 转置,不再进行标准化
+         main = "Differential Metabolites Heatmap",
+         cluster_rows = TRUE,      # 代谢物聚类
+         cluster_cols = TRUE,      # 样本聚类
+         show_colnames = FALSE,    # 不显示样本名（太多）
+         show_rownames = TRUE,     # 显示代谢物名
+         annotation_col = annotation_row,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         fontsize_row = 8,
+         cutree_rows = k_optimal,          # 按3类切割代谢物树状图
+         cutree_cols = k_optimal,            # 按3类切割样本树状图
+         breaks = seq(-2, 2, length.out = 101)) 
+
+#（方法二） 3.1 差异代谢物热图（按聚类排序）
+library(pheatmap)
+library(dplyr)
+
+# 选择前50个最显著的差异代谢物
+top_sig_metabolites <- diff_results %>%
+  filter(p_adjust < 0.05) %>%
+  arrange(p_adjust) %>%
+  head(50) %>%
+  pull(metabolite)
+
+# 提取训练集数据
+heatmap_data <- train_lipids[, top_sig_metabolites]
+
+#给代谢物替换真实名称
+substitute_list <- fread("代谢物名字替代名单.csv")
+# 获取当前列名
+current_names <- names(heatmap_data)
+# 使用 match 找到每个当前列名在 surrogate 中的位置
+# 注意：如果列名不在 surrogate 中，match 会返回 NA
+idx <- match(current_names, substitute_list$surrogate)
+# 生成新列名：如果匹配到则用对应的 name，否则保留原列名
+new_names <- ifelse(!is.na(idx), 
+                    substitute_list$name[idx], 
+                    current_names)
+
+# 替换列名
+names(heatmap_data) <- new_names
+
+
+# 获取聚类信息并按聚类排序
+cluster_order <- order(train_clinical$cluster)
+heatmap_data_sorted <- heatmap_data[cluster_order, ]
+train_clinical_sorted <- train_clinical[cluster_order, ]
+
+# 添加聚类信息作为行注释
+annotation_row <- data.frame(Cluster = train_clinical_sorted$cluster)
+rownames(annotation_row) <- rownames(heatmap_data_sorted)
+
+# 设置颜色
+colors_cluster <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")[1:length(unique(train_clinical_sorted$cluster))]
+names(colors_cluster) <- levels(train_clinical_sorted$cluster)
+ann_colors <- list(Cluster = colors_cluster)
+
+# 绘制热图（样本按聚类排序，不对列进行聚类）
+pheatmap(t(heatmap_data_sorted),
+         main = "Differential Metabolites Heatmap",
+         cluster_rows = TRUE,      # 代谢物聚类
+         cluster_cols = FALSE,     # 不进行样本聚类，保持按聚类排序的顺序
+         show_colnames = FALSE,    # 不显示样本名
+         show_rownames = TRUE,     # 不显示代谢物名
+         annotation_col = annotation_row,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         fontsize_row = 8,
+         cutree_rows = k_optimal,  # 按3类切割代谢物树状图
+         gaps_col = cumsum(table(train_clinical_sorted$cluster))[-length(table(train_clinical_sorted$cluster))],  # 在聚类之间添加分隔线
+         breaks = seq(-2, 2, length.out = 101))
+
+# 4. 训练集生存分析
+# 4.1 绘制Kaplan-Meier曲线
+km_train <- survfit(Surv(dfs_time, dfs) ~ cluster, data = train_clinical)
+
+# 在生存分析部分定义颜色调色板
+library(survminer)
+library(gridExtra)
+library(RColorBrewer)
+train_palette <- c("#6baed6", "#fd8d3c", "#74c476")  # 较浅的蓝色、橙色、绿色
+test_palette <- c("#2171b5", "#d94701", "#238b45")  # 较深的蓝色、橙色、绿色
+train_plot <- ggsurvplot(km_train, data = train_clinical,
+           pval = TRUE, pval.method = TRUE,
+           pval.size = 8,                # 增大p值文本
+           risk.table = TRUE,
+           risk.table.fontsize = 6,    
+           palette = train_palette, # 使用较浅的颜色
+           title = "Training Set Survival Analysis",
+           font.title = c(22, "bold", "black"),   # 标题大小22，粗体
+           font.x = c(20, "plain", "black"),       # X轴标签大小20
+           font.y = c(20, "plain", "black"),       # Y轴标签大小20
+           font.tickslab = c(18, "plain", "black"),# 刻度标签大小18
+           font.legend = c(16, "plain"),     # 图例曲线标签（大小16）
+           xlab = "Time (days)",
+           tables.theme = theme(
+              axis.text.x = element_text(size = 18),   # X轴刻度数字
+              axis.text.y = element_text(size = 18),   # Y轴刻度数字（即风险表的行标签）
+              axis.title.x = element_text(size = 20),  # X轴标题（通常为“Time”）
+              axis.title.y = element_text(size = 20),  # Y轴标题（通常为“Number at risk”）
+              plot.title = element_text(size = 20,face = "bold")     # 风险表标题
+              )
+           )
+# 将标题居中对齐
+train_plot$plot <- train_plot$plot + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# 4.2 单因素Cox分析（仅cluster）
+uni_cox_train <- coxph(Surv(dfs_time, dfs) ~ cluster, data = train_clinical)
+summary(uni_cox_train)
+
+# 4.3 多因素Cox分析（调整其他临床变量）
+multi_cox_train <- coxph(Surv(dfs_time, dfs) ~ cluster+sex+age+new_stage+smoking+bmi,data = train_clinical)
+summary(multi_cox_train)
+
+# 提取风险比和置信区间
+train_cox_results <- data.frame(
+  Variable = rownames(summary(multi_cox_train)$coefficients),
+  HR = exp(coef(multi_cox_train)),
+  CI_lower = exp(confint(multi_cox_train))[, 1],
+  CI_upper = exp(confint(multi_cox_train))[, 2],
+  P_value = summary(multi_cox_train)$coefficients[, 5]
+)
+print("训练集多因素Cox分析结果：")
+print(train_cox_results)
+
+# 4.4 单因素逻辑回归
+library(broom)
+#单因素
+uni_logit_train <- glm(dfs_3yr ~ cluster, data = train_clinical,family = binomial(link = "logit"))
+summary(uni_logit_train)
+uni_logit_train_OR <- tidy(uni_logit_train, exponentiate = TRUE, conf.int = TRUE)
+uni_logit_train_OR
+# 4.5 多因素逻辑回归 
+multi_logit_train <- glm(dfs_3yr ~ cluster+sex+age+new_stage+smoking+bmi,data =train_clinical,family = binomial(link = "logit"))
+summary(multi_logit_train)
+multi_logit_train_OR <- tidy(multi_logit_train, exponentiate = TRUE, conf.int = TRUE)
+multi_logit_train_OR
+
+# 5. 验证集分析
+# 5.1 使用训练集的聚类中心对验证集进行聚类
+# 使用所有代谢物进行聚类
+train_centers <- kmeans_train$centers# 使用所有代谢物的聚类中心
+
+# 计算验证集样本到训练集聚类中心的距离
+dist_matrix <- matrix(0, nrow = nrow(test_lipids), ncol = nrow(train_centers))
+for(i in 1:nrow(test_lipids)) {
+  for(j in 1:nrow(train_centers)) {
+    dist_matrix[i, j] <- sqrt(sum((test_lipids[i, ] - train_centers[j, ])^2))
+  }
+}
+
+# 将验证集样本分配到最近的聚类中心
+test_clinical$cluster <- as.factor(apply(dist_matrix, 1, which.min))
+#test_clinical$cluster <- factor(test_clinical$cluster, levels = c("2", "1", "3"))
+summary(test_clinical$cluster)
+
+# 5.2 验证集生存分析
+# 5.2.1 绘制Kaplan-Meier曲线
+km_test <- survfit(Surv(dfs_time, dfs) ~ cluster, data = test_clinical)
+test_plot <- ggsurvplot(km_test, data = test_clinical,
+           pval = TRUE, pval.method = TRUE,
+           pval.size = 8,
+           risk.table = TRUE,
+           risk.table.fontsize = 6,    
+           palette = test_palette,  # 使用较深的颜色
+           title = "Validation Set Survival Analysis",
+           font.title = c(22, "bold", "black"),
+           font.x = c(20, "plain", "black"),
+           font.y = c(20, "plain", "black"),
+           font.tickslab = c(18, "plain", "black"),
+           font.legend = c(16, "plain"),
+           xlab = "Time (days)",
+           tables.theme = theme(
+              axis.text.x = element_text(size = 18),   # X轴刻度数字
+              axis.text.y = element_text(size = 18),   # Y轴刻度数字（即风险表的行标签）
+              axis.title.x = element_text(size = 20),  # X轴标题（通常为“Time”）
+              axis.title.y = element_text(size = 20),  # Y轴标题（通常为“Number at risk”）
+              plot.title = element_text(size = 20,face = "bold")     # 风险表标题
+              )
+           )
+# 将标题居中对齐
+test_plot$plot <- test_plot$plot + 
+  theme(plot.title = element_text(hjust = 0.5)) #hjust = 0.5 表示水平居中（取值范围 0 左对齐，0.5 居中，1 右对齐）
+
+
+# 使用arrange_ggsurvplots合并图片
+cluster_combined_plots <- arrange_ggsurvplots(
+  list(train_plot, test_plot),
+  ncol = 2, nrow = 1,  # 一行两列，横向并排
+  print = FALSE
+)
+
+# 保存到PDF
+pdf("combined_survival_plots_horizontal.pdf", width = 20, height = 10)
+print(cluster_combined_plots)
+dev.off()
+
+# 5.2.2 单因素Cox分析（仅cluster）
+uni_cox_test <- coxph(Surv(dfs_time, dfs) ~ cluster, data = test_clinical)
+summary(uni_cox_test)
+
+# 5.2.3 多因素Cox分析（调整其他临床变量）
+multi_cox_test <- coxph(Surv(dfs_time, dfs) ~ cluster+sex+age+new_stage+smoking+bmi,data = test_clinical)
+summary(multi_cox_test)
+
+# 提取风险比和置信区间
+test_cox_results <- data.frame(
+  Variable = rownames(summary(multi_cox_test)$coefficients),
+  HR = exp(coef(multi_cox_test)),
+  CI_lower = exp(confint(multi_cox_test))[, 1],
+  CI_upper = exp(confint(multi_cox_test))[, 2],
+  P_value = summary(multi_cox_test)$coefficients[, 5]
+)
+print("验证集多因素Cox分析结果：")
+print(test_cox_results)
+
+# 5.3 单因素逻辑回归
+library(broom)
+uni_logit_test <- glm(dfs_3yr ~ cluster, data = test_clinical,family = binomial(link = "logit"))
+summary(uni_logit_test)
+uni_logit_test_OR <- tidy(uni_logit_test, exponentiate = TRUE, conf.int = TRUE)
+uni_logit_test_OR
+# 5.4 多因素逻辑回归 
+multi_logit_test <- glm(dfs_3yr ~ cluster+sex+age+new_stage+smoking+bmi,data =test_clinical,family = binomial(link = "logit"))
+summary(multi_logit_test)
+multi_logit_test_OR <- tidy(multi_logit_test, exponentiate = TRUE, conf.int = TRUE)
+multi_logit_test_OR
+
+# 6. 结果汇总
+# 创建结果汇总表
+results_summary <- data.frame(
+  数据集 = c("训练集", "验证集"),
+  样本数 = c(nrow(train_clinical), nrow(test_clinical)),
+  聚类数 = c(k_optimal, k_optimal),
+  显著代谢物数 = c(length(sig_metabolites), length(sig_metabolites)),
+  单因素HR_cluster2 = c(
+    exp(coef(uni_cox_train))["cluster2"],
+    exp(coef(uni_cox_test))["cluster2"]
+  ),
+  单因素HR_cluster3 = c(
+    exp(coef(uni_cox_train))["cluster3"],
+    exp(coef(uni_cox_test))["cluster3"]
+  ),
+  单因素P值 = c(
+    summary(uni_cox_train)$coefficients["cluster2", 5],
+    summary(uni_cox_test)$coefficients["cluster2", 5]
+  ),
+  多因素P值_cluster = c(
+    summary(multi_cox_train)$coefficients["cluster2", 5],
+    summary(multi_cox_test)$coefficients["cluster2", 5]
+  )
+)
+
+print(results_summary)
+
+# 7. 可视化Cox分析结果
+# 7.1 绘制森林图（训练集）
+ggforest(multi_cox_train, data = train_clinical,
+         main = "Hazard Ratio of Training Set (Multivariate Cox)")
+
+# 7.2 绘制森林图（验证集）
+ggforest(multi_cox_test, data = test_clinical,
+         main = "Hazard Ratio of Validation Set (Multivariate Cox)")
+
+# 8. 可视化聚类结果（可选）
+# 训练集PCA可视化
+pca_train <- prcomp(train_lipids, scale. = FALSE)
+pca_train_df <- as.data.frame(pca_train$x[, 1:2])
+pca_train_df$cluster <- train_clinical$cluster
+
+p1 <- ggplot(pca_train_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95) +
+  labs(title = "Training Set Clustering (PCA)", 
+       subtitle = paste("Using",ncol(train_lipids), "metabolites")) +
+  theme_minimal()
+
+# 验证集PCA可视化
+pca_test <- prcomp(test_lipids, scale. = FALSE)
+pca_test_df <- as.data.frame(pca_test$x[, 1:2])
+pca_test_df$cluster <- test_clinical$cluster
+
+p2 <- ggplot(pca_test_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95) +
+  labs(title = "Validation Set Clustering (PCA)", 
+       subtitle = paste("Using",ncol(test_lipids), "metabolites")) +
+  theme_minimal()
+
+# 并排显示
+library(gridExtra)
+grid.arrange(p1, p2, ncol = 2)
+
+```
+#图形摘要聚类生存曲线
+```{r}
+# 训练集曲线
+train_plot1 <- ggsurvplot(km_train, data = train_clinical,
+                          pval = TRUE, pval.method = TRUE,
+                          pval.size = 8,                # 增大p值文本
+                          palette = train_palette,
+                          title = "Training Set Survival Analysis",
+                          font.title = c(22, "bold", "black"),   # 标题大小20，粗体
+                          font.x = c(20, "plain", "black"),       # X轴标签大小18
+                          font.y = c(20, "plain", "black"),       # Y轴标签大小18
+                          font.tickslab = c(18, "plain", "black"),# 刻度标签大小18
+                          font.legend = c(16, "plain"),     # 图例曲线标签（大小14）
+                          xlab = "Time (days)")
+# 验证集曲线
+test_plot1 <- ggsurvplot(km_test, data = test_clinical,
+                         pval = TRUE, pval.method = TRUE,
+                         pval.size = 8,
+                         palette = test_palette,
+                         title = "Validation Set Survival Analysis",
+                         font.title = c(22, "bold", "black"),
+                         font.x = c(20, "plain", "black"),
+                         font.y = c(20, "plain", "black"),
+                         font.tickslab = c(18, "plain", "black"),
+                         font.legend = c(16, "plain"),
+                         xlab = "Time (days)")
+
+
+train_plot1$plot <- train_plot1$plot + theme(aspect.ratio = 1,plot.title = element_text(hjust = 0.5))
+test_plot1$plot  <- test_plot1$plot  + theme(aspect.ratio = 1,plot.title = element_text(hjust = 0.5))
+library(cowplot)
+
+combined_plots <- plot_grid(
+  train_plot1$plot,
+  test_plot1$plot,
+  ncol = 2,
+  rel_widths = c(1, 1),
+  labels = c("A", "B")          # 可选，添加子图标签
+)
+pdf("combined_survival_plots_square.pdf", width = 20, height = 10)
+print(combined_plots)
+dev.off()
+
+```
+
+
+#相关性检验
+```{r}
+# 1. 读取数据
+data <- fread("merged_data.csv")
+# 2. 转换为data.frame
+data_df <- as.data.frame(data)
+# 提取X1到X2866的数值变量（假设这些是数值型变量）
+# 注意：根据实际情况调整列范围
+x_vars <- data_df[, grep("^X[0-9]+$", names(data_df))]
+
+# 3. 计算相关系数矩阵
+cor_matrix <- cor(x_vars, use = "pairwise.complete.obs")
+
+# 4. 查看矩阵维度
+dim(cor_matrix)
+
+# 5. 查看前几行前几列
+cor_matrix[1:10, 1:10]
+# 由于相关系数矩阵是对称的，上述方法会包含重复的对（如X1-X2和X2-X1）
+# 以下代码只保留上三角部分，避免重复，创建上三角索引
+upper_tri <- upper.tri(cor_matrix)
+# 6. 查看高度相关（>0.8或<-0.8）的变量对
+high_cor <- which(abs(cor_matrix) > 0.8 & abs(cor_matrix) < 1 & upper_tri, arr.ind = TRUE)
+high_cor_pairs <- data.frame(
+  Var1 = rownames(cor_matrix)[high_cor[, 1]],
+  Var2 = colnames(cor_matrix)[high_cor[, 2]],
+  Correlation = cor_matrix[high_cor]
+)
+unique_high_cor_vars <- unique(c(high_cor_pairs$Var1, high_cor_pairs$Var2))
+fwrite(high_cor_pairs, "all_high_correlation_pairs_unsorted.csv", row.names = FALSE)
+fwrite(data.frame(Variable = unique_high_cor_vars), 
+          "unique_high_correlation_variables_unsorted.csv", 
+          row.names = FALSE)
+```
+#选择p值较小的变量
+```{r include=FALSE}
+# 加载必要包
+library(readxl)
+library(dplyr)
+
+# 读取工作簿2和工作簿3或4，工作簿3是原始数据脂质相关变量，4是标准化后的脂质相关变量
+df2 <- read_excel("工作簿2.xlsx")
+df3 <- read_excel("工作簿4.xlsx")  # 假设包含Var1和Var2两列
+
+# 为df3中的每对变量选择p值更小的那个
+selected_vars <- df3 %>%
+  rowwise() %>%
+  mutate(
+    p1 = df2$p_value[df2$surrogate == Var1],
+    p2 = df2$p_value[df2$surrogate == Var2],
+    selected_var = ifelse(p1 <= p2, Var1, Var2),
+    selected_p = min(p1, p2, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# 获取最终选择的唯一变量
+final_vars <- selected_vars %>%
+  distinct(selected_var) %>%
+  left_join(df2, by = c("selected_var" = "surrogate")) 
+
+# 输出结果
+write.csv(selected_vars, "selected_variables.csv", row.names = FALSE)
+write.csv(final_vars, "final_selected_variables.csv", row.names = FALSE)
+```
+
+#设置5：5的训练集和验证集
+```{r}
+library(dplyr)
+library(lubridate)
+
+df <- fread("merged_data.csv", stringsAsFactors = FALSE)
+df$sex <- factor(df$sex)
+df$stage <- factor(df$stage)
+df$smoking <- factor(df$smoking)
+df$alcohol <- factor(df$alcohol)
+df$neo_adjuvant_therapy <- factor(df$neo_adjuvant_therapy)
+df$perineural_invasion <- factor(df$perineural_invasion)
+df$TC <- as.numeric(df$TC)
+df$TG <- as.numeric(df$TG)
+df$HDL <- as.numeric(df$HDL)
+df$LDL <- as.numeric(df$LDL)
+df$non_HDL <- as.numeric(df$non_HDL)
+df$TG1 <- as.numeric(df$TG1)
+df$HDL1 <- as.numeric(df$HDL1)
+df$LDL1 <- as.numeric(df$LDL1)
+df$new_stage <- as.numeric(df$new_stage)
+df$stage_34vs12 <- factor(df$stage_34vs12)
+df$Dyslipidemia <- factor(df$Dyslipidemia)
+df$bmi2 <- factor(df$bmi2)
+df$bmi3 <- factor(df$bmi3)
+df$TG2 <- factor(df$TG2)
+df$TC2 <- factor(df$TC2)
+df$HDL2 <- factor(df$HDL2)
+df$LDL2 <- factor(df$LDL2)
+df$non_HDL2 <- factor(df$non_HDL2)
+
+df$surgery_date <- as.Date(df$surgery_date)
+
+# 3. 按手术日期排序
+df <- df[order(df$surgery_date), ]
+
+# 4. 计算分割点（6:4比例）
+total_rows <- nrow(df)
+train_size <- floor(0.5 * total_rows)
+
+# 5. 分割数据集
+train_data <- df[1:train_size, ]
+test_data <- df[(train_size + 1):total_rows, ]
+
+#merged_data <- train_data
+#merged_data <- test_data
+```
+
+#单因素cox分析
+```{r}
+#单变量cox分析
+library(survival)
+which(colnames(merged_data) == "X2866")
+metabolite_cols <- 2:2867
+# 创建空列表存储结果
+cox_results <- list()
+
+# 获取总样本数
+total_samples <- nrow(merged_data)
+
+# 循环进行单变量Cox回归分析
+for (i in metabolite_cols) {
+  # 获取代谢物名称
+  metabolite_name <- names(merged_data)[i]
+  # 构建Cox模型公式
+  formula <- as.formula(paste("Surv(dfs_time, dfs) ~", metabolite_name))
+   # 使用tryCatch处理可能出现的错误
+  tryCatch({
+  # 拟合Cox模型
+  cox_model <- coxph(formula, data = merged_data)
+  # 提取模型摘要
+  model_summary <- summary(cox_model)
+  
+   # 计算模型使用的样本信息
+  n_total <- cox_model$n  # 模型中的总人数（无缺失值）
+  n_event <- cox_model$nevent  # 事件数
+  n_missing <- total_samples - n_total  # 缺失值数量
+  
+  # 提取HR值
+  HR <- exp(model_summary$coefficients[1, 1])
+  # 提取置信区间 -从conf.int中提取
+  # 注意：conf.int包含4列：exp(coef)、exp(-coef)、lower .95、upper .95
+  HR_lower <- model_summary$conf.int[1, 3]  # lower .95
+  HR_upper <- model_summary$conf.int[1, 4]  # upper .95
+  # 提取p值
+  p_value <- model_summary$coefficients[1, 5]
+  
+  # 存储结果
+    cox_results[[metabolite_name]] <- data.frame(
+      Metabolite = metabolite_name,
+      n_total = n_total,
+      n_event = n_event,
+      n_missing = n_missing,
+      HR = HR,
+      HR_lower = HR_lower,
+      HR_upper = HR_upper,
+      p_value = p_value,
+      stringsAsFactors = FALSE)
+  }, error = function(e) {
+    # 如果分析出错，存储NA值
+    cox_results[[metabolite_name]] <- data.frame(
+      Metabolite = metabolite_name,
+      n_total = NA,
+      n_event = NA,
+      n_missing = sum(is.na(merged_data[[metabolite_name]])),
+      HR = NA,
+      HR_lower = NA,
+      HR_upper = NA,
+      p_value = NA,
+      stringsAsFactors = FALSE)
+  })
+}
+
+# 将结果转换为数据框
+result_df <- do.call(rbind, cox_results)
+result_df <- as.data.frame(result_df)
+
+# 添加代谢物名称列
+result_df$Metabolite <- rownames(result_df)
+
+# 计算FDR校正的p值（BH方法）
+result_df$p_adj <- p.adjust(result_df$p_value, method = "BH")
+
+# 重排列顺序，将代谢物名称放在第一列
+result_df <- result_df[, c("Metabolite", "n_total", "n_event", "n_missing", 
+                           "HR", "HR_lower", "HR_upper", "p_value", "p_adj")]
+
+# 保存结果为CSV文件
+fwrite(result_df, "univariate_cox_results.csv", row.names = FALSE)
+```
+
+#多因素cox分析
+```{r}
+#多因素cox分析
+library(survival)
+
+# 定义协变量
+covariates <- c("sex", "age", "new_stage", "smoking", "bmi")
+
+# 创建空列表存储结果
+multivariate_results  <- list()
+
+# 循环进行多因素Cox回归分析
+for (i in 2:2867) {
+  # 获取代谢物名称
+  metabolite_name <- names(merged_data)[i]
+  
+  # 构建多因素Cox模型公式
+  formula <- as.formula(paste("Surv(dfs_time,dfs) ~", metabolite_name, "+", 
+                              paste(covariates, collapse = " + ")))
+  
+  # 使用tryCatch处理可能出现的错误
+  tryCatch({
+  # 拟合多因素Cox模型
+  cox_model <- coxph(formula, data = merged_data)
+    # 提取模型摘要
+    model_summary <- summary(cox_model)
+    
+     # 计算模型使用的样本信息
+  n_total <- cox_model$n  # 总人数
+  n_event <- cox_model$nevent  # 事件数
+  n_missing <- nrow(merged_data) - n_total  # 缺失值
+  
+  # 提取代谢物的统计量（在多因素模型中）
+  # 注意：代谢物是第一个变量，协变量在后面
+  coef_index <- 1  # 代谢物在模型中的系数索引
+  
+  # 提取代谢物的HR值
+    HR <- exp(model_summary$coefficients[coef_index, 1])
+    
+    # 提取代谢物的置信区间
+    HR_lower <- model_summary$conf.int[coef_index, 3]  # 95% CI下限
+    HR_upper <- model_summary$conf.int[coef_index, 4]  # 95% CI上限
+    
+    # 提取代谢物的p值
+    p_value <- model_summary$coefficients[coef_index, 5]
+    
+  # 存储结果
+    multivariate_results[[metabolite_name]] <- data.frame(
+      Metabolite = metabolite_name,
+      n_total = n_total,
+      n_event = n_event,
+      n_missing = n_missing,
+      HR = HR,
+      HR_lower = HR_lower,
+      HR_upper = HR_upper,
+      p_value = p_value,
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) {
+    # 如果分析出错，存储NA值
+    multivariate_results[[metabolite_name]] <- data.frame(
+      Metabolite = metabolite_name,
+      n_total = NA,
+      n_event = NA,
+      n_missing = NA,
+      HR = NA,
+      HR_lower = NA,
+      HR_upper = NA,
+      p_value = NA,
+      stringsAsFactors = FALSE
+    )
+  })
+}
+
+
+# 将结果转换为数据框
+multivariate_df <- do.call(rbind, multivariate_results)
+multivariate_df <- as.data.frame(multivariate_df)
+
+# 添加代谢物名称列
+multivariate_df$Metabolite <- rownames(multivariate_df)
+
+# 计算FDR校正的p值（BH方法）
+multivariate_df$p_adj <- p.adjust(multivariate_df$p_value, method = "BH")
+
+# 重排列顺序，将代谢物名称放在第一列
+multivariate_df <- multivariate_df[, c("Metabolite", "n_total", "n_event", "n_missing", 
+                                         "HR", "HR_lower", "HR_upper", "p_value", "p_adj")]
+
+
+# 保存结果为CSV文件
+fwrite(multivariate_df, "multivariate_cox_results.csv", row.names = FALSE)
+
+```
+
+#图形摘要森林图
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 数据准备（同上）
+data <- data.frame(
+  Lipid = c("Cer(d18:1_18:0)", "Cer(42:6)", "PC(18:0_18:2(9Z,12Z))", 
+            "PC 34:6", "PA 36:1", "LacCer(d18:1_16:0)", 
+            "Hex1Cer(45:8)", "ST(34:1)", "SM(d41:2)"),
+  HR_train = c(2.14, 1.66, 1.64, 1.78, 1.86, 1.58, 1.58, 1.75, 1.43),
+  CI_lower_train = c(1.51, 1.16, 1.19, 1.21, 1.31, 1.17, 1.16, 1.21, 1.11),
+  CI_upper_train = c(3.02, 2.36, 2.26, 2.63, 2.64, 2.15, 2.16, 2.54, 1.82),
+  HR_val = c(1.74, 1.77, 1.79, 1.72, 1.95, 1.38, 1.39, 1.68, 1.54),
+  CI_lower_val = c(1.40, 1.30, 1.33, 1.35, 1.43, 1.00, 1.02, 1.33, 1.10),
+  CI_upper_val = c(2.16, 2.42, 2.42, 2.18, 2.66, 1.89, 1.90, 2.12, 2.14)
+)
+
+# 转换长格式
+plot_data <- data.frame(
+  Lipid = rep(data$Lipid, 2),
+  HR = c(data$HR_train, data$HR_val),
+  CI_lower = c(data$CI_lower_train, data$CI_lower_val),
+  CI_upper = c(data$CI_upper_train, data$CI_upper_val),
+  Set = rep(c("Training", "Validation"), each = nrow(data)),
+  y_pos = rep(seq(nrow(data), 1), 2)
+)
+
+# 偏移位置避免重叠
+plot_data$y_pos <- ifelse(plot_data$Set == "Training", 
+                          plot_data$y_pos + 0.2, 
+                          plot_data$y_pos - 0.2)
+
+# 绘图
+p <- ggplot(plot_data, aes(x = HR, y = y_pos, color = Set)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.5) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), 
+                 height = 0.15, linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Training" = "#2E5F8E", "Validation" = "#B22222")) +
+  scale_y_continuous(breaks = seq(nrow(data), 1), 
+                     labels = rev(data$Lipid)) +
+  scale_x_continuous(limits = c(0, 4), breaks = seq(0, 4, 1), expand = c(0, 0)) +
+  coord_cartesian(ylim = c(0.5, nrow(data) + 0.5)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "#7A8B99", fill = NA, linewidth = 1.5),
+    plot.background = element_rect(fill = "#F5F9F8", color = NA),
+    panel.background = element_rect(fill = "#F5F9F8", color = NA),
+    axis.text.y = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(size = 14),
+    axis.title = element_blank(),
+    axis.line.x = element_line(color = "#7A8B99", linewidth = 0.8),  # 官方X轴线
+    axis.line.y = element_line(color = "#7A8B99", linewidth = 0.8),  # 官方Y轴线
+    legend.position = "none"
+  )
+ 
+ggsave("forest_plot.pdf", p, width = 8, height = 10, device = cairo_pdf)
+ggsave("forest_plot.svg", p, width = 8, height = 10)
+print(p)
+```
+
+#单因素Logistic回归分析
+```{r}
+#单因素Logistic回归分析
+metabolite_cols <- 2:2867
+logistic_results <- list()
+total_samples <- nrow(merged_data)
+
+# 进行单变量逻辑回归分析
+for (i in metabolite_cols) {
+  metabolite_name <- names(merged_data)[i]
+  # 构建逻辑回归公式
+  formula <- as.formula(paste("dfs_3yr ~", metabolite_name))
+
+  tryCatch({
+    # 拟合逻辑回归模型
+    logistic_model <- glm(formula, 
+                         data = merged_data, 
+                         family = binomial(link = "logit"))
+    
+    # 提取模型摘要
+    model_summary <- summary(logistic_model)
+    
+    # 计算模型使用的样本信息
+    n_total <- nrow(logistic_model$model)  # 模型实际使用的样本数
+    n_event <- sum(merged_data$dfs_3yr == 1, na.rm = TRUE)  # 复发事件数
+    
+    # 计算该代谢物的缺失值数
+    n_missing <- nrow(merged_data) - n_total
+    # 计算模型拟合指标
+    log_likelihood <- logLik(logistic_model)[1]
+    aic <- AIC(logistic_model)
+    null_deviance <- logistic_model$null.deviance
+    residual_deviance <- logistic_model$deviance
+    pseudo_r2 <- 1 - (residual_deviance / null_deviance)
+    
+    # 提取OR值（优势比）
+    OR <- exp(model_summary$coefficients[2, 1])  # 第2行是代谢物的系数
+    
+    # 计算OR的95%置信区间
+    conf_int <- confint(logistic_model)
+    OR_lower <- exp(conf_int[2, 1])  # 代谢物的下限
+    OR_upper <- exp(conf_int[2, 2])  # 代谢物的上限
+    
+    # 提取p值
+    p_value <- model_summary$coefficients[2, 4]  # 第4列是p值
+    
+    # 计算模型拟合指标（可选）
+    log_likelihood <- logLik(logistic_model)[1]
+    aic <- AIC(logistic_model)
+    null_deviance <- logistic_model$null.deviance
+    residual_deviance <- logistic_model$deviance
+    pseudo_r2 <- 1 - (residual_deviance / null_deviance)
+    
+    # 存储结果
+    logistic_results[[metabolite_name]] <- data.frame(
+    Metabolite = metabolite_name,
+    n_total = n_total,
+    n_event = n_event,
+    n_missing = n_missing,
+    OR = OR,
+    OR_lower = OR_lower,
+    OR_upper = OR_upper,
+    p_value = p_value,
+    log_likelihood = log_likelihood,
+    AIC = aic,
+    pseudo_R2 = pseudo_r2,
+    stringsAsFactors = FALSE
+)
+    
+  }, error = function(e) {
+    # 如果分析失败，存储NA值
+    logistic_results[[metabolite_name]] <- data.frame(
+      Metabolite = metabolite_name,
+      n_total = NA,
+      n_event = NA,
+      n_missing = sum(is.na(merged_data[[metabolite_name]])),
+      OR = NA,
+      OR_lower = NA,
+      OR_upper = NA,
+      p_value = NA,
+      log_likelihood = NA,
+      AIC = NA,
+      pseudo_R2 = NA,
+      stringsAsFactors = FALSE
+    )
+  })
+}
+
+# 转换结果为数据框
+result_df <- do.call(rbind, logistic_results)
+result_df <- as.data.frame(result_df)
+
+# 添加代谢物名称列
+result_df$Metabolite <- rownames(result_df)
+
+# 计算FDR校正的p值
+result_df$p_adj <- p.adjust(result_df$p_value, method = "BH")
+
+# 重新排列列顺序
+result_df <- result_df[, c("Metabolite", "n_total", "n_event", "n_missing", 
+                           "OR", "OR_lower", "OR_upper", "p_value", "p_adj","log_likelihood", "AIC", "pseudo_R2")]
+
+# 保存结果
+fwrite(result_df, "univariate_logistic_results.csv", row.names = FALSE)
+
+
+#将X4拿出来检验
+a <- merged_data[,c(1,5,2868:2924)]
+logit_model_a <- glm(dfs_3yr ~ X4, 
+                   data = a, 
+                   family = binomial(link = "logit"))
+b <- summary(logit_model_a)
+b
+OR <- exp(b$coefficients)
+OR
+conf_int_a <- confint(logit_model_a)
+conf_int_a
+CI <- exp(conf_int_a)
+CI
+
+```
+#多因素Logistic回归分析
+```{r}
+#多因素Logistic回归分析
+library(data.table)
+
+# 定义协变量
+covariates <- c("sex", "age", "new_stage", "smoking", "bmi")
+
+# 创建空列表存储结果
+multivariate_results <- list()
+
+# 循环进行多因素逻辑回归分析
+for (i in 2:2867) {
+  # 获取代谢物名称
+  metabolite_name <- names(merged_data)[i]
+  
+  # 构建多因素逻辑回归模型公式
+  formula <- as.formula(paste("dfs_3yr ~", metabolite_name, "+", 
+                              paste(covariates, collapse = " + ")))
+  
+  # 使用tryCatch处理可能出现的错误
+  tryCatch({
+    # 拟合多因素逻辑回归模型
+    logistic_model <- glm(formula, 
+                         data = merged_data, 
+                         family = binomial(link = "logit"))
+    
+    # 提取模型摘要
+    model_summary <- summary(logistic_model)
+    
+    # 计算模型使用的样本信息
+    n_total <- nrow(logistic_model$model)  # 模型实际使用的样本数
+    
+    # 计算事件数（假设dfs=1表示复发）
+    # 注意：这里计算的是整个数据集中复发事件的总数
+    n_event <- sum(merged_data$dfs_3yr == 1, na.rm = TRUE)
+    
+    # 计算该模型中的缺失值数
+    # 多因素模型中的缺失值包括代谢物和协变量的缺失
+    n_missing <- nrow(merged_data) - n_total
+    
+    # 提取代谢物的统计量
+    # 注意：在多因素模型中，代谢物通常是第一个变量（在截距之后）
+    coef_index <- 1  # 代谢物在模型中的系数索引（通常为1，截距为0）
+    
+    # 提取代谢物的OR值
+    OR <- exp(model_summary$coefficients[coef_index + 1, 1])  # +1跳过截距
+    
+    # 计算代谢物的OR置信区间
+    conf_int <- confint(logistic_model)
+    OR_lower <- exp(conf_int[coef_index + 1, 1])  # +1跳过截距
+    OR_upper <- exp(conf_int[coef_index + 1, 2])  # +1跳过截距
+    
+    # 提取代谢物的p值
+    p_value <- model_summary$coefficients[coef_index + 1, 4]  # 第4列是p值
+    
+    # 提取更多模型统计量（可选）
+    log_likelihood <- logLik(logistic_model)[1]
+    aic <- AIC(logistic_model)
+    null_deviance <- logistic_model$null.deviance
+    residual_deviance <- logistic_model$deviance
+    pseudo_r2 <- 1 - (residual_deviance / null_deviance)
+    
+    # 存储结果
+    multivariate_results[[metabolite_name]] <- data.frame(
+      Metabolite = metabolite_name,
+      n_total = n_total,
+      n_event = n_event,
+      n_missing = n_missing,
+      OR = OR,
+      OR_lower = OR_lower,
+      OR_upper = OR_upper,
+      p_value = p_value,
+      log_likelihood = log_likelihood,
+      AIC = aic,
+      pseudo_R2 = pseudo_r2,
+      stringsAsFactors = FALSE
+    )
+    
+  }, error = function(e) {
+    # 如果分析出错，存储NA值
+    multivariate_results[[metabolite_name]] <- data.frame(
+      Metabolite = metabolite_name,
+      n_total = NA,
+      n_event = NA,
+      n_missing = NA,
+      OR = NA,
+      OR_lower = NA,
+      OR_upper = NA,
+      p_value = NA,
+      log_likelihood = NA,
+      AIC = NA,
+      pseudo_R2 = NA,
+      stringsAsFactors = FALSE
+    )
+  })
+}
+
+# 将结果转换为数据框
+multivariate_df <- do.call(rbind, multivariate_results)
+multivariate_df <- as.data.frame(multivariate_df)
+
+# 添加代谢物名称列
+multivariate_df$Metabolite <- rownames(multivariate_df)
+
+# 计算FDR校正的p值（BH方法）
+multivariate_df$p_adj <- p.adjust(multivariate_df$p_value, method = "BH")
+
+# 重排列顺序，将代谢物名称放在第一列
+multivariate_df <- multivariate_df[, c("Metabolite", "n_total", "n_event", "n_missing", 
+                                       "OR", "OR_lower", "OR_upper", "p_value", "p_adj",
+                                       "log_likelihood", "AIC", "pseudo_R2")]
+
+# 保存结果为CSV文件
+fwrite(multivariate_df, "multivariate_logistic_results.csv", row.names = FALSE)
+
+#将X4拿出来检验
+c <- merged_data[,c(1,5,2868:2924)]
+logit_model_c <- glm(dfs_3yr ~ X4+sex+age+new_stage+smoking+bmi, 
+                   data = c,family = binomial(link = "logit"))
+d <- summary(logit_model_c)
+d
+OR <- exp(d$coefficients)
+OR
+conf_int_c <- confint(logit_model_c)
+conf_int_c
+CI <- exp(conf_int_c)
+CI
+```
+
+#单独校正脂质代谢p值
+```{r}
+#单独校正脂质代谢p值
+#library(dplyr)
+#lipid_metabolome_p_adj <- read.csv("lipid_metabolome_p_adj.csv", stringsAsFactors = FALSE)
+
+# 查看数据结构
+#head(lipid_metabolome_p_adj)
+#str(lipid_metabolome_p_adj)
+#lipid_metabolome_p_adj$class <- factor(lipid_metabolome_p_adj$class)
+# 2. 新增两列p值校正结果
+#lipid_metabolome_p_adj <- lipid_metabolome_p_adj %>%
+#  mutate(
+    # 对所有脂质代谢物进行p值校正（FDR校正）
+#    p_adj_all_lipid = p.adjust(p_value, method = "BH"), 
+    # 对Lipid类进行p值校正（仅在Lipid类内部校正）
+#    p_adj_lipid = ifelse(
+#      class == "Lipid", 
+#      p.adjust(p_value[class == "Lipid"], method = "BH"),  # 在Lipid内部校正
+#      NA)
+#  )
+#summary(lipid_metabolome_p_adj)
+#write.csv(lipid_metabolome_p_adj, "lipid_metabolome_p_adj.csv", row.names = FALSE)
+
+
+
+#直接复制校正p值，推荐
+library(dplyr)
+lipid_metabolome_p_adj <- read.csv("lipid_metabolome_p_adj.csv", stringsAsFactors = FALSE)
+# 定义关注的脂质类别
+lipid_classes <- c("Lipid", "Steroids and steroid derivatives", "Fatty Acyls", 
+                   "Prenol lipids", "Glycerophospholipids", "Glycerolipids", "Sphingolipids")
+
+# 为原始数据添加唯一标识符（行号）
+lipid_metabolome_p_adj$row_id <- 1:nrow(lipid_metabolome_p_adj)
+
+# 步骤1：筛选出关注的类别并计算校正p值
+lipid_data <- lipid_metabolome_p_adj %>%
+  filter(class %in% lipid_classes) %>%
+  group_by(class) %>%  # 按类别分组
+  mutate(
+    # 在每个类别内部单独校正
+    p_adj_within_class = p.adjust(p_value, method = "BH")
+  ) %>%
+  ungroup() %>%  # 取消分组
+  mutate(
+    # 在所有关注的脂质类别中一起校正
+    p_adj_all_lipid = p.adjust(p_value, method = "BH")
+  )
+
+# 步骤2：合并回原始数据
+lipid_metabolome_p_adj <- lipid_metabolome_p_adj %>%
+  left_join(
+    lipid_data %>% select(row_id, p_adj_all_lipid, p_adj_within_class),
+    by = "row_id"
+  ) %>%
+  select(-row_id)  # 移除临时行ID
+
+summary(lipid_metabolome_p_adj)
+write.csv(lipid_metabolome_p_adj, "lipid_metabolome_p_adj.csv", row.names = FALSE)
+```
+
+#检测过代谢物的215人血脂的os,dfs
+```{r}
+library(readr)
+#Blood_lipid_215 <- read_csv("merged_data.csv")
+Blood_lipid_215 <- read_csv("merged_data.csv", locale = locale(encoding = "GBK"))
+Blood_lipid_215 <- Blood_lipid_215[,c(1,2868:2924)]
+fwrite(Blood_lipid_215,file = "Blood_lipid_215.csv",row.names = FALSE)
+summary(Blood_lipid_215)
+Blood_lipid_215$sex <- factor(Blood_lipid_215$sex)
+Blood_lipid_215$stage <- factor(Blood_lipid_215$stage)
+Blood_lipid_215$smoking <- factor(Blood_lipid_215$smoking)
+Blood_lipid_215$alcohol <- factor(Blood_lipid_215$alcohol)
+Blood_lipid_215$neo_adjuvant_therapy <- factor(Blood_lipid_215$neo_adjuvant_therapy)
+Blood_lipid_215$perineural_invasion <- factor(Blood_lipid_215$perineural_invasion)
+Blood_lipid_215$TC <- as.numeric(Blood_lipid_215$TC)
+Blood_lipid_215$TG <- as.numeric(Blood_lipid_215$TG)
+Blood_lipid_215$HDL <- as.numeric(Blood_lipid_215$HDL)
+Blood_lipid_215$LDL <- as.numeric(Blood_lipid_215$LDL)
+Blood_lipid_215$non_HDL <- as.numeric(Blood_lipid_215$non_HDL)
+Blood_lipid_215$TG1 <- as.numeric(Blood_lipid_215$TG1)
+Blood_lipid_215$HDL1 <- as.numeric(Blood_lipid_215$HDL1)
+Blood_lipid_215$LDL1 <- as.numeric(Blood_lipid_215$LDL1)
+Blood_lipid_215$new_stage <- as.numeric(Blood_lipid_215$new_stage)
+Blood_lipid_215$stage_34vs12 <- factor(Blood_lipid_215$stage_34vs12)
+Blood_lipid_215$Dyslipidemia <- factor(Blood_lipid_215$Dyslipidemia)
+Blood_lipid_215$bmi2 <- factor(Blood_lipid_215$bmi2)
+Blood_lipid_215$bmi3 <- factor(Blood_lipid_215$bmi3)
+Blood_lipid_215$TG2 <- factor(Blood_lipid_215$TG2)
+Blood_lipid_215$TC2 <- factor(Blood_lipid_215$TC2)
+Blood_lipid_215$HDL2 <- factor(Blood_lipid_215$HDL2)
+Blood_lipid_215$LDL2 <- factor(Blood_lipid_215$LDL2)
+Blood_lipid_215$non_HDL2 <- factor(Blood_lipid_215$non_HDL2)
+summary(Blood_lipid_215)
+```
+##cox分析
+###os单因素
+```{r}
+library(survival)
+fit_os_sex<- coxph(Surv(os_time,os)~sex,data=Blood_lipid_215)
+summary(fit_os_sex)
+fit_os_age<- coxph(Surv(os_time,os)~age,data=Blood_lipid_215)
+summary(fit_os_age)
+#fit_os_stage<- coxph(Surv(os_time,os)~stage,data=Blood_lipid_215)
+#summary(fit_os_stage)
+fit_os_bmi<- coxph(Surv(os_time,os)~bmi,data=Blood_lipid_215)
+summary(fit_os_bmi)
+fit_os_smoking<- coxph(Surv(os_time,os)~smoking,data=Blood_lipid_215)
+summary(fit_os_smoking)
+fit_os_alcohol<- coxph(Surv(os_time,os)~alcohol,data=Blood_lipid_215)
+summary(fit_os_alcohol)
+fit_os_neo_adjuvant_therapy<- coxph(Surv(os_time,os)~neo_adjuvant_therapy,data=Blood_lipid_215)
+summary(fit_os_neo_adjuvant_therapy)
+fit_os_height_cm<- coxph(Surv(os_time,os)~height_cm,data=Blood_lipid_215)
+summary(fit_os_height_cm)
+fit_os_weight_kg<- coxph(Surv(os_time,os)~weight_kg,data=Blood_lipid_215)
+summary(fit_os_weight_kg)
+fit_os_perineural_invasion<- coxph(Surv(os_time,os)~perineural_invasion,data=Blood_lipid_215)
+summary(fit_os_perineural_invasion)
+fit_os_TG<- coxph(Surv(os_time,os)~TG,data=Blood_lipid_215)
+summary(fit_os_TG)
+fit_os_TC<- coxph(Surv(os_time,os)~TC,data=Blood_lipid_215)
+summary(fit_os_TC)
+fit_os_HDL<- coxph(Surv(os_time,os)~HDL,data=Blood_lipid_215)
+summary(fit_os_HDL)
+fit_os_LDL<- coxph(Surv(os_time,os)~LDL,data=Blood_lipid_215)
+summary(fit_os_LDL)
+fit_os_non_HDL<- coxph(Surv(os_time,os)~non_HDL,data=Blood_lipid_215)
+summary(fit_os_non_HDL)
+fit_os_new_stage<- coxph(Surv(os_time,os)~new_stage,data=Blood_lipid_215)
+summary(fit_os_new_stage)
+fit_os_stage_34vs12<- coxph(Surv(os_time,os)~stage_34vs12,data=Blood_lipid_215)
+summary(fit_os_stage_34vs12)
+fit_os_Dyslipidemia<- coxph(Surv(os_time,os)~Dyslipidemia,data=Blood_lipid_215)
+summary(fit_os_Dyslipidemia)
+
+#分类变量
+fit_os_bmi2<- coxph(Surv(os_time,os)~bmi2,data=Blood_lipid_215)
+summary(fit_os_bmi2)
+fit_os_bmi3<- coxph(Surv(os_time,os)~bmi3,data=Blood_lipid_215)
+summary(fit_os_bmi3)
+fit_os_TG2<- coxph(Surv(os_time,os)~TG2,data=Blood_lipid_215)
+summary(fit_os_TG2)
+fit_os_TC2<- coxph(Surv(os_time,os)~TC2,data=Blood_lipid_215)
+summary(fit_os_TC2)
+fit_os_HDL2<- coxph(Surv(os_time,os)~HDL2,data=Blood_lipid_215)
+summary(fit_os_HDL2)
+fit_os_LDL2<- coxph(Surv(os_time,os)~LDL2,data=Blood_lipid_215)
+summary(fit_os_LDL2)
+fit_os_non_HDL2<- coxph(Surv(os_time,os)~non_HDL2,data=Blood_lipid_215)
+summary(fit_os_non_HDL2)
+```
+###dfs单因素
+```{r}
+fit_dfs_sex<- coxph(Surv(dfs_time,dfs)~sex,data=Blood_lipid_215)
+summary(fit_dfs_sex)
+fit_dfs_age<- coxph(Surv(dfs_time,dfs)~age,data=Blood_lipid_215)
+summary(fit_dfs_age)
+#fit_dfs_stage<- coxph(Surv(dfs_time,dfs)~stage,data=Blood_lipid_215)
+#summary(fit_dfs_stage)
+fit_dfs_bmi<- coxph(Surv(dfs_time,dfs)~bmi,data=Blood_lipid_215)
+summary(fit_dfs_bmi)
+fit_dfs_smoking<- coxph(Surv(dfs_time,dfs)~smoking,data=Blood_lipid_215)
+summary(fit_dfs_smoking)
+fit_dfs_alcohol<- coxph(Surv(dfs_time,dfs)~alcohol,data=Blood_lipid_215)
+summary(fit_dfs_alcohol)
+fit_dfs_neo_adjuvant_therapy<- coxph(Surv(dfs_time,dfs)~neo_adjuvant_therapy,data=Blood_lipid_215)
+summary(fit_dfs_neo_adjuvant_therapy)
+fit_dfs_height_cm<- coxph(Surv(dfs_time,dfs)~height_cm,data=Blood_lipid_215)
+summary(fit_dfs_height_cm)
+fit_dfs_weight_kg<- coxph(Surv(dfs_time,dfs)~weight_kg,data=Blood_lipid_215)
+summary(fit_dfs_weight_kg)
+fit_dfs_perineural_invasion<- coxph(Surv(dfs_time,dfs)~perineural_invasion,data=Blood_lipid_215)
+summary(fit_dfs_perineural_invasion)
+fit_dfs_TG<- coxph(Surv(dfs_time,dfs)~TG,data=Blood_lipid_215)
+summary(fit_dfs_TG)
+fit_dfs_TC<- coxph(Surv(dfs_time,dfs)~TC,data=Blood_lipid_215)
+summary(fit_dfs_TC)
+fit_dfs_HDL<- coxph(Surv(dfs_time,dfs)~HDL,data=Blood_lipid_215)
+summary(fit_dfs_HDL)
+fit_dfs_LDL<- coxph(Surv(dfs_time,dfs)~LDL,data=Blood_lipid_215)
+summary(fit_dfs_LDL)
+fit_dfs_non_HDL<- coxph(Surv(dfs_time,dfs)~non_HDL,data=Blood_lipid_215)
+summary(fit_dfs_non_HDL)
+fit_dfs_new_stage<- coxph(Surv(dfs_time,dfs)~new_stage,data=Blood_lipid_215)
+summary(fit_dfs_new_stage)
+fit_dfs_stage_34vs12<- coxph(Surv(dfs_time,dfs)~stage_34vs12,data=Blood_lipid_215)
+summary(fit_dfs_stage_34vs12)
+fit_dfs_Dyslipidemia<- coxph(Surv(dfs_time,dfs)~Dyslipidemia,data=Blood_lipid_215)
+summary(fit_dfs_Dyslipidemia)
+
+#分类变量
+fit_dfs_bmi2<- coxph(Surv(dfs_time,dfs)~bmi2,data=Blood_lipid_215)
+summary(fit_dfs_bmi2)
+fit_dfs_bmi3<- coxph(Surv(dfs_time,dfs)~bmi3,data=Blood_lipid_215)
+summary(fit_dfs_bmi3)
+fit_dfs_TG2<- coxph(Surv(dfs_time,dfs)~TG2,data=Blood_lipid_215)
+summary(fit_dfs_TG2)
+fit_dfs_TC2<- coxph(Surv(dfs_time,dfs)~TC2,data=Blood_lipid_215)
+summary(fit_dfs_TC2)
+fit_dfs_HDL2<- coxph(Surv(dfs_time,dfs)~HDL2,data=Blood_lipid_215)
+summary(fit_dfs_HDL2)
+fit_dfs_LDL2<- coxph(Surv(dfs_time,dfs)~LDL2,data=Blood_lipid_215)
+summary(fit_dfs_LDL2)
+fit_dfs_non_HDL2<- coxph(Surv(dfs_time,dfs)~non_HDL2,data=Blood_lipid_215)
+summary(fit_dfs_non_HDL2)
+```
+###os多因素
+```{r}
+fit_os1<- coxph(Surv(os_time,os)~sex+age+new_stage+bmi+smoking+alcohol+neo_adjuvant_therapy+TG+TC+HDL+LDL+non_HDL+perineural_invasion,data=Blood_lipid_215)
+summary(fit_os1)
+fit_os2<- coxph(Surv(os_time,os)~sex+age+new_stage+bmi+smoking+alcohol+neo_adjuvant_therapy+TG+HDL+LDL,data=Blood_lipid_215)
+summary(fit_os2)
+fit_os3<- coxph(Surv(os_time,os)~sex+age+new_stage+bmi+smoking+alcohol+neo_adjuvant_therapy+Dyslipidemia,data=Blood_lipid_215)
+summary(fit_os3)
+
+#分类变量
+fit_os4<- coxph(Surv(os_time,os)~sex+age+new_stage+bmi2+smoking+alcohol+neo_adjuvant_therapy+TG2+TC2+HDL2+LDL2+non_HDL2+perineural_invasion,data=Blood_lipid_215)
+summary(fit_os4)
+fit_os5<- coxph(Surv(os_time,os)~sex+age+new_stage+bmi2+smoking+alcohol+neo_adjuvant_therapy+TG2+HDL2+LDL2,data=Blood_lipid_215)
+summary(fit_os5)
+fit_os6<- coxph(Surv(os_time,os)~sex+age+new_stage+bmi2+smoking+alcohol+neo_adjuvant_therapy+Dyslipidemia,data=Blood_lipid_215)
+summary(fit_os6)
+```
+###dfs多因素
+```{r}
+fit_dfs1<- coxph(Surv(dfs_time,dfs)~sex+age+new_stage+bmi+smoking+alcohol+neo_adjuvant_therapy+TG+TC+HDL+LDL+non_HDL+perineural_invasion,data=Blood_lipid_215)
+summary(fit_dfs1)
+fit_dfs2<- coxph(Surv(dfs_time,dfs)~sex+age+new_stage+bmi+smoking+alcohol+neo_adjuvant_therapy+TG+HDL+LDL,data=Blood_lipid_215)
+summary(fit_dfs2)
+fit_dfs3<- coxph(Surv(dfs_time,dfs)~sex+age+new_stage+bmi+smoking+alcohol+neo_adjuvant_therapy+Dyslipidemia,data=Blood_lipid_215)
+summary(fit_dfs3)
+
+#分类变量
+fit_dfs4<- coxph(Surv(dfs_time,dfs)~sex+age+new_stage+bmi2+smoking+alcohol+neo_adjuvant_therapy+TG2+TC2+HDL2+LDL2+non_HDL2+perineural_invasion,data=Blood_lipid_215)
+summary(fit_dfs4)
+fit_dfs5<- coxph(Surv(dfs_time,dfs)~sex+age+new_stage+bmi2+smoking+alcohol+neo_adjuvant_therapy+TG2+HDL2+LDL2,data=Blood_lipid_215)
+summary(fit_dfs5)
+fit_dfs6<- coxph(Surv(dfs_time,dfs)~sex+age+new_stage+bmi2+smoking+alcohol+neo_adjuvant_therapy+Dyslipidemia,data=Blood_lipid_215)
+summary(fit_dfs6)
+```
+
+##逻辑回归分析
+###dfs单因素
+```{r}
+# 使用1年DFS作为结局
+# 连续变量分析
+library(broom)
+fit_dfs_sex_1yr <- glm(dfs_1yr ~ sex, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_sex_1yr)
+fit_dfs_sex_1yr_OR <- tidy(fit_dfs_sex_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_sex_1yr_OR
+
+fit_dfs_age_1yr <- glm(dfs_1yr ~ age, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_age_1yr)
+fit_dfs_age_1yr_OR <- tidy(fit_dfs_age_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_age_1yr_OR
+
+fit_dfs_bmi_1yr <- glm(dfs_1yr ~ bmi, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_bmi_1yr)
+fit_dfs_bmi_1yr_OR <- tidy(fit_dfs_bmi_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_bmi_1yr_OR
+
+fit_dfs_smoking_1yr <- glm(dfs_1yr ~ smoking, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_smoking_1yr)
+fit_dfs_smoking_1yr_OR <- tidy(fit_dfs_smoking_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_smoking_1yr_OR
+
+fit_dfs_alcohol_1yr <- glm(dfs_1yr ~ alcohol, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_alcohol_1yr)
+fit_dfs_alcohol_1yr_OR <- tidy(fit_dfs_alcohol_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_alcohol_1yr_OR
+
+fit_dfs_neo_adjuvant_therapy_1yr <- glm(dfs_1yr ~ neo_adjuvant_therapy, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_neo_adjuvant_therapy_1yr)
+fit_dfs_neo_adjuvant_therapy_1yr_OR <- tidy(fit_dfs_neo_adjuvant_therapy_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_neo_adjuvant_therapy_1yr_OR
+
+fit_dfs_height_cm_1yr <- glm(dfs_1yr ~ height_cm, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_height_cm_1yr)
+fit_dfs_height_cm_1yr_OR <- tidy(fit_dfs_height_cm_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_height_cm_1yr_OR
+
+fit_dfs_weight_kg_1yr <- glm(dfs_1yr ~ weight_kg, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_weight_kg_1yr)
+fit_dfs_weight_kg_1yr_OR <- tidy(fit_dfs_weight_kg_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_weight_kg_1yr_OR
+
+fit_dfs_perineural_invasion_1yr <- glm(dfs_1yr ~ perineural_invasion, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_perineural_invasion_1yr)
+fit_dfs_perineural_invasion_1yr_OR <- tidy(fit_dfs_perineural_invasion_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_perineural_invasion_1yr_OR
+
+fit_dfs_TG_1yr <- glm(dfs_1yr ~ TG, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_TG_1yr)
+fit_dfs_TG_1yr_OR <- tidy(fit_dfs_TG_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_TG_1yr_OR
+
+fit_dfs_TC_1yr <- glm(dfs_1yr ~ TC, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_TC_1yr)
+fit_dfs_TC_1yr_OR <- tidy(fit_dfs_TC_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_TC_1yr_OR
+
+fit_dfs_HDL_1yr <- glm(dfs_1yr ~ HDL, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_HDL_1yr)
+fit_dfs_HDL_1yr_OR <- tidy(fit_dfs_HDL_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_HDL_1yr_OR
+
+fit_dfs_LDL_1yr <- glm(dfs_1yr ~ LDL, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_LDL_1yr)
+fit_dfs_LDL_1yr_OR <- tidy(fit_dfs_LDL_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_LDL_1yr_OR
+
+fit_dfs_non_HDL_1yr <- glm(dfs_1yr ~ non_HDL, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_non_HDL_1yr)
+fit_dfs_non_HDL_1yr_OR <- tidy(fit_dfs_non_HDL_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_non_HDL_1yr_OR
+
+fit_dfs_new_stage_1yr <- glm(dfs_1yr ~ new_stage, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_new_stage_1yr)
+fit_dfs_new_stage_1yr_OR <- tidy(fit_dfs_new_stage_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_new_stage_1yr_OR
+
+fit_dfs_stage_34vs12_1yr <- glm(dfs_1yr ~ stage_34vs12, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_stage_34vs12_1yr)
+fit_dfs_stage_34vs12_1yr_OR <- tidy(fit_dfs_stage_34vs12_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_stage_34vs12_1yr_OR
+
+fit_dfs_Dyslipidemia_1yr <- glm(dfs_1yr ~ Dyslipidemia, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_Dyslipidemia_1yr)
+fit_dfs_Dyslipidemia_1yr_OR <- tidy(fit_dfs_Dyslipidemia_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_Dyslipidemia_1yr_OR
+
+# 分类变量（重新分组后的变量）
+fit_dfs_bmi2_1yr <- glm(dfs_1yr ~ bmi2, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_bmi2_1yr)
+fit_dfs_bmi2_1yr_OR <- tidy(fit_dfs_bmi2_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_bmi2_1yr_OR
+
+fit_dfs_bmi3_1yr <- glm(dfs_1yr ~ bmi3, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_bmi3_1yr)
+fit_dfs_bmi3_1yr_OR <- tidy(fit_dfs_bmi3_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_bmi3_1yr_OR
+
+fit_dfs_TG2_1yr <- glm(dfs_1yr ~ TG2, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_TG2_1yr)
+fit_dfs_TG2_1yr_OR <- tidy(fit_dfs_TG2_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_TG2_1yr_OR
+
+fit_dfs_TC2_1yr <- glm(dfs_1yr ~ TC2, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_TC2_1yr)
+fit_dfs_TC2_1yr_OR <- tidy(fit_dfs_TC2_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_TC2_1yr_OR
+
+fit_dfs_HDL2_1yr <- glm(dfs_1yr ~ HDL2, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_HDL2_1yr)
+fit_dfs_HDL2_1yr_OR <- tidy(fit_dfs_HDL2_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_HDL2_1yr_OR
+
+fit_dfs_LDL2_1yr <- glm(dfs_1yr ~ LDL2, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_LDL2_1yr)
+fit_dfs_LDL2_1yr_OR <- tidy(fit_dfs_LDL2_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_LDL2_1yr_OR
+
+fit_dfs_non_HDL2_1yr <- glm(dfs_1yr ~ non_HDL2, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs_non_HDL2_1yr)
+fit_dfs_non_HDL2_1yr_OR <- tidy(fit_dfs_non_HDL2_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs_non_HDL2_1yr_OR
+```
+
+###dfs多因素
+```{r}
+# 连续变量模型
+# 使用1年DFS作为结局
+#fit_dfs1_1yr <- glm(dfs_1yr ~ sex + age + new_stage + bmi + smoking + TG + TC + HDL + LDL + non_HDL,  data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs1_1yr)
+#fit_dfs1_1yr_OR <- tidy(fit_dfs1_1yr, exponentiate = TRUE, conf.int = TRUE)
+#fit_dfs1_1yr_OR
+
+fit_dfs2_1yr <- glm(dfs_1yr ~ sex + age + new_stage + bmi + smoking + TG + HDL + LDL,data = Blood_lipid_215, family = binomial)
+summary(fit_dfs2_1yr)
+fit_dfs2_1yr_OR <- tidy(fit_dfs2_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs2_1yr_OR
+
+fit_dfs3_1yr <- glm(dfs_1yr ~ sex + age + new_stage + bmi + smoking + Dyslipidemia, data = Blood_lipid_215, family = binomial)
+summary(fit_dfs3_1yr)
+fit_dfs3_1yr_OR <- tidy(fit_dfs3_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs3_1yr_OR
+
+#分类变量模型
+#fit_dfs4_1yr <- glm(dfs_1yr ~ sex + age + new_stage + bmi2 + smoking + TG2 + TC2 + HDL2 + LDL2 + non_HDL2, data = Blood_lipid_215, family = binomial)
+#summary(fit_dfs4_1yr)
+#fit_dfs4_1yr_OR <- tidy(fit_dfs4_1yr, exponentiate = TRUE, conf.int = TRUE)
+#fit_dfs4_1yr_OR
+
+fit_dfs5_1yr <- glm(dfs_1yr ~ sex + age + new_stage + bmi2 + smoking + TG2 + HDL2 + LDL2, data = Blood_lipid_215, family = binomial)
+summary(fit_dfs5_1yr)
+fit_dfs5_1yr_OR <- tidy(fit_dfs5_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs5_1yr_OR
+
+fit_dfs6_1yr <- glm(dfs_1yr ~ sex + age + new_stage + bmi2 + smoking + Dyslipidemia, data = Blood_lipid_215, family = binomial)
+summary(fit_dfs6_1yr)
+fit_dfs6_1yr_OR <- tidy(fit_dfs6_1yr, exponentiate = TRUE, conf.int = TRUE)
+fit_dfs6_1yr_OR
+```
+
+
